@@ -5,10 +5,14 @@ This runs a quick evaluation with reduced parameters for demonstration purposes.
 
 import sys
 import os
-import warnings
-warnings.filterwarnings('ignore')
 
+# Add src to path before other imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
+import warnings
+# Suppress specific warnings for cleaner output
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 from data.data_loader import CryptoDataLoader
 from models.predictors import LSTMPredictor, GRUPredictor

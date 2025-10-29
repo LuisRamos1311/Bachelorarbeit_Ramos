@@ -5,10 +5,14 @@ This script tests data loading and basic model functionality without running ful
 
 import sys
 import os
+
+# Add src to path before other imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 import warnings
-warnings.filterwarnings('ignore')
+# Suppress specific warnings that are expected during testing
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import numpy as np
 from data.data_loader import CryptoDataLoader
