@@ -1,0 +1,2 @@
+# Bachelorarbeit_Ramos
+Bachelorarbeit Wirtschaftsinformatik
