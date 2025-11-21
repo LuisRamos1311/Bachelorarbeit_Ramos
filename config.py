@@ -76,7 +76,7 @@ INDICATOR_COLS: List[str] = [
     "rsi_14",
 ]
 
-# Full list of feature columns fed into the model
+# Full list of feature columns fed into the model (current "past covariates")
 FEATURE_COLS: List[str] = PRICE_VOLUME_COLS + INDICATOR_COLS
 
 # (For the future) additional sentiment feature columns
@@ -89,6 +89,22 @@ SENTIMENT_COLS: List[str] = [
     # Fill these in when you implement sentiment_features.py
 ]
 
+# -------- Advanced TFT-style feature grouping (Phase 0 groundwork) --------
+# In the original TFT, inputs are split into:
+#   - static covariates       (do not change over time)
+#   - past time-varying       (observed up to "now")
+#   - known future covariates (known into the future, e.g. calendar features)
+
+# For now, we treat all existing FEATURE_COLS as past time-varying covariates.
+PAST_COVARIATE_COLS: List[str] = FEATURE_COLS.copy()
+
+# Known future inputs (e.g. calendar features like day_of_week, month) will go here.
+# Right now this is empty; we will populate it when we add simple future inputs.
+FUTURE_COVARIATE_COLS: List[str] = []
+
+# Static covariates (e.g. asset ID, regime label) – not used yet for single BTC.
+STATIC_COLS: List[str] = []
+
 # ============================
 # 4. MODEL HYPERPARAMETERS
 # ============================
@@ -99,16 +115,12 @@ class ModelConfig:
     """
     Hyperparameters for the Temporal Fusion Transformer-style model.
 
-    This *simplified* TFT implementation uses:
-    - an input projection from raw features to a hidden_size
-    - an LSTM encoder over the past sequence
+    Current implementation:
+    - input projection from raw features to hidden_size
+    - LSTM encoder over the past sequence
     - multi-head self-attention over the encoded sequence
-    - a small position-wise feed-forward network
-    - a final linear layer that outputs one logit for binary up/down
-
-    We do NOT yet include all advanced TFT features (static covariates,
-    known future inputs, etc.) to keep the project manageable for a
-    bachelor thesis. Those can be added later if needed.
+    - position-wise feed-forward network
+    - final linear layer that outputs one logit for binary up/down
     """
 
     # Number of input features per time step (must match FEATURE_COLS length)
@@ -128,6 +140,28 @@ class ModelConfig:
 
     # Hidden size of the position-wise feed-forward network
     ff_hidden_size: int = 128
+
+    # -------- Advanced TFT-style options (Phase 0 switches) --------
+
+    # Use GRN + GLU gating around key submodules (we'll wire this in tft_model.py).
+    use_gating: bool = True
+
+    # Use Variable Selection Networks over past and future covariates.
+    use_variable_selection: bool = True
+
+    # Use known future covariates (e.g. calendar features).
+    # Initially False – we will enable it when we extend data_pipeline & model.
+    use_future_covariates: bool = False
+
+    # Hidden size used inside variable selection networks (VSNs) and GRNs.
+    variable_selection_hidden_size: int = 64
+
+    # Hidden size for potential static covariate encoders (multi-asset extension).
+    static_hidden_size: int = 16
+
+    # Number of future-covariate features per time step.
+    # Computed from FUTURE_COVARIATE_COLS; currently 0.
+    future_input_size: int = len(FUTURE_COVARIATE_COLS)
 
     # Placeholder for future extension with static covariates
     use_static_covariates: bool = False
