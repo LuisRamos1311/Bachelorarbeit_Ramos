@@ -19,3 +19,6 @@ it additionally prints the last 3 timesteps of the same sequence
 This just helps you see how the window starts and how it ends 
 (how indicators and prices evolve over the 30 days). 
 It doesn’t change any data, it’s only for inspection and understanding.
+
+Trying to expand the project to add tools that differentiate tft from others
+GRNs, VSNs, known future inputs
