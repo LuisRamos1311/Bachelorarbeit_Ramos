@@ -6,11 +6,14 @@ Turns raw daily BTC price data into PyTorch Datasets for the TFT model.
 Main steps:
 1. Load daily BTC OHLCV data from CSV.
 2. Add technical indicators (ROC, ATR, MACD, RSI).
-3. Create binary up/down label for next day.
-4. Split into train / validation / test sets by date.
-5. Scale features (prices & volume with MinMax, indicators with StandardScaler).
-6. Build sliding window sequences for the TFT model.
-7. Provide a BTCTFTDataset class to be used in train_tft.py and evaluate_tft.py.
+3. Add calendar and halving-related features (per day).
+4. Create "next-day" future covariate columns via shift(-1).
+5. Create binary up/down label for next day.
+6. Split into train / validation / test sets by date.
+7. Scale features (prices & volume with MinMax, indicators with StandardScaler).
+8. Build sliding window sequences for the TFT model (past inputs) and
+   per-sample future covariate vectors.
+9. Provide a BTCTFTDataset class to be used in train_tft.py and evaluate_tft.py.
 """
 
 import os
@@ -19,7 +22,7 @@ from typing import List, Tuple, Dict
 import numpy as np
 import pandas as pd
 import torch
-import talib # Technical Analysis library (C + Python wrapper)
+import talib  # Technical Analysis library (C + Python wrapper)
 import config
 
 from torch.utils.data import Dataset
@@ -27,7 +30,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 
 # ============================
-# 2. LOADING & PREPROCESSING
+# 1. LOADING & PREPROCESSING
 # ============================
 
 def load_btc_daily(csv_path: str | None = None) -> pd.DataFrame:
@@ -109,7 +112,7 @@ def load_btc_daily(csv_path: str | None = None) -> pd.DataFrame:
 
 
 # ============================
-# 3. TECHNICAL INDICATORS
+# 2. TECHNICAL INDICATORS
 # ============================
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -164,6 +167,138 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================
+# 3. CALENDAR & HALVING FEATURES
+# ============================
+
+def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add per-day calendar features:
+
+        - day_of_week : 0=Monday, ..., 6=Sunday
+        - is_weekend  : 1 if Saturday/Sunday, else 0
+        - month       : 1–12
+
+    These are base features for day t, used later to derive t+1 covariates.
+    """
+    df = df.copy()
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("DataFrame index must be a DatetimeIndex to add calendar features.")
+
+    # Day of week: Monday=0, Sunday=6
+    df["day_of_week"] = df.index.dayofweek
+
+    # Weekend flag: 1 if Saturday (5) or Sunday (6), else 0
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+
+    # Month number: 1–12
+    df["month"] = df.index.month
+
+    return df
+
+
+def add_halving_features(df: pd.DataFrame, window_days: int = 90) -> pd.DataFrame:
+    """
+    Add per-day halving-related features:
+
+        - days_to_next_halving : integer days from t to the next halving date
+        - is_halving_window    : 1 if within ±window_days of any halving date
+
+    Halving dates are known (or well-approximated) in advance, so they are
+    valid sources of "known future" information for crypto.
+    """
+    df = df.copy()
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("DataFrame index must be a DatetimeIndex to add halving features.")
+
+    # Known / approximate Bitcoin halving dates.
+    # These do NOT have to be perfect to be useful as a feature.
+    halving_dates = [
+        pd.Timestamp("2012-11-28"),
+        pd.Timestamp("2016-07-09"),
+        pd.Timestamp("2020-05-11"),
+        pd.Timestamp("2024-04-19"),  # recent halving (approx / actual)
+        pd.Timestamp("2028-04-20"),  # approximate next halving
+    ]
+
+    dates = df.index.to_pydatetime()
+    num_rows = len(df)
+
+    days_to_next_halving = np.zeros(num_rows, dtype=np.float32)
+    is_halving_window = np.zeros(num_rows, dtype=np.int64)
+
+    for i, current_date in enumerate(dates):
+        # Compute day differences to each halving date
+        day_diffs = np.array(
+            [(hd - current_date).days for hd in halving_dates],
+            dtype=np.int32,
+        )
+
+        # Days to the next halving (smallest non-negative diff if exists,
+        # otherwise the closest halving in absolute terms).
+        non_negative = day_diffs[day_diffs >= 0]
+        if len(non_negative) > 0:
+            days_next = int(non_negative.min())
+        else:
+            # After last halving: just take the closest halving in absolute value
+            days_next = int(day_diffs[np.argmin(np.abs(day_diffs))])
+
+        days_to_next_halving[i] = days_next
+
+        # Halving window flag: within ±window_days of ANY halving
+        nearest_days = int(day_diffs[np.argmin(np.abs(day_diffs))])
+        if abs(nearest_days) <= window_days:
+            is_halving_window[i] = 1
+
+    df["days_to_next_halving"] = days_to_next_halving
+    df["is_halving_window"] = is_halving_window
+
+    return df
+
+
+def add_future_covariates(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create next-day (t+1) future covariate columns by shifting base features.
+
+    We use:
+        - day_of_week      -> dow_next
+        - is_weekend       -> is_weekend_next
+        - month            -> month_next
+        - is_halving_window -> is_halving_window_next
+
+    After this transformation, at index t we have information about day t+1
+    in these *_next columns. The last row will have NaNs for these columns
+    (because there is no t+1), but it will be dropped later together with
+    the NaN target in add_target_column().
+    """
+    df = df.copy()
+
+    required_base_cols = [
+        "day_of_week",
+        "is_weekend",
+        "month",
+        "is_halving_window",
+    ]
+    missing = [c for c in required_base_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"add_future_covariates expected base columns {required_base_cols}, "
+            f"but missing: {missing}. Make sure to call add_calendar_features() "
+            f"and add_halving_features() first."
+        )
+
+    # Shift base features by -1 so that at index t we store information
+    # corresponding to day t+1.
+    df["dow_next"] = df["day_of_week"].shift(-1)
+    df["is_weekend_next"] = df["is_weekend"].shift(-1)
+    df["month_next"] = df["month"].shift(-1)
+    df["is_halving_window_next"] = df["is_halving_window"].shift(-1)
+
+    return df
+
+
+# ============================
 # 4. TARGET (UP / DOWN LABEL)
 # ============================
 
@@ -179,6 +314,7 @@ def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOL
          target_up = 1 if future_return_t > up_threshold else 0
 
     We drop the last row because it has no "next day" to compare to.
+    This also removes the NaNs created in add_future_covariates().
     """
     df = df.copy()
 
@@ -189,7 +325,7 @@ def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOL
     # Binary label: 1 if future return > threshold, else 0
     df["target_up"] = (df["future_return_1d"] > up_threshold).astype(int)
 
-    # Last row will have NaN future_return_1d, so drop it
+    # Last row will have NaN future_return_1d (and *_next columns), so drop it
     df = df.dropna(subset=["future_return_1d"])
 
     return df
@@ -295,17 +431,26 @@ def build_sequences(
     df: pd.DataFrame,
     feature_cols: List[str],
     seq_length: int = config.SEQ_LENGTH,
-) -> Tuple[np.ndarray, np.ndarray]:
+    future_cols: List[str] | None = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
     Build sliding-window sequences and labels from a DataFrame.
 
     For each sample:
-        - X: sequence of length `seq_length` over feature_cols
-        - y: 'target_up' value of the LAST day in the sequence
+        - X_past: sequence of length `seq_length` over feature_cols
+        - y:      'target_up' value of the LAST day in the sequence
+        - f:      (optional) vector of future covariates for t+1
+
+    We assume:
+        - target_up at day t encodes up/down from t -> t+1
+        - *_next columns at day t already contain information about t+1
+          (created via add_future_covariates() using shift(-1)).
 
     Example:
         If seq_length = 30, we use days [t-29, ..., t] as input,
-        and y = target_up at day t (which encodes up/down from t -> t+1).
+        and:
+            y = target_up at day t
+            f = future covariates stored at day t (describing t+1).
     """
     if "target_up" not in df.columns:
         raise ValueError("DataFrame must contain 'target_up' column before building sequences.")
@@ -316,23 +461,46 @@ def build_sequences(
     feature_array = df[feature_cols].values.astype(np.float32)
     target_array = df["target_up"].values.astype(np.float32)
 
-    sequences = []
-    labels = []
+    if future_cols is not None:
+        for col in future_cols:
+            if col not in df.columns:
+                raise ValueError(
+                    f"Future covariate column '{col}' is missing. "
+                    f"Make sure add_future_covariates() was called."
+                )
+        future_array = df[future_cols].values.astype(np.float32)
+    else:
+        future_array = None
+
+    sequences: List[np.ndarray] = []
+    labels: List[float] = []
+    future_covariates: List[np.ndarray] = []
 
     # We start at index seq_length-1 because we need seq_length days for the first sample
     for end_idx in range(seq_length - 1, len(df)):
         start_idx = end_idx - seq_length + 1
 
+        # Past sequence for days [start_idx, ..., end_idx]
         seq_x = feature_array[start_idx : end_idx + 1]   # shape: (seq_length, n_features)
-        y = target_array[end_idx]                        # scalar label
+        y = target_array[end_idx]                        # scalar label at day t=end_idx
 
         sequences.append(seq_x)
         labels.append(y)
 
-    sequences = np.stack(sequences)   # shape: (num_samples, seq_length, n_features)
-    labels = np.array(labels)         # shape: (num_samples,)
+        # Future covariates for day t+1 (stored at row t=end_idx)
+        if future_array is not None:
+            f = future_array[end_idx]                    # shape: (n_future_features,)
+            future_covariates.append(f)
 
-    return sequences, labels
+    sequences = np.stack(sequences)          # shape: (num_samples, seq_length, n_features)
+    labels = np.array(labels)                # shape: (num_samples,)
+
+    if future_array is not None:
+        future_covariates_arr: np.ndarray | None = np.stack(future_covariates)  # (num_samples, n_future_features)
+    else:
+        future_covariates_arr = None
+
+    return sequences, labels, future_covariates_arr
 
 
 # ============================
@@ -344,16 +512,33 @@ class BTCTFTDataset(Dataset):
     Simple PyTorch Dataset for BTC TFT model.
 
     Holds:
-        - sequences: numpy array of shape (N, seq_length, n_features)
-        - labels:    numpy array of shape (N,)
+        - sequences:         numpy array of shape (N, seq_length, n_features)
+        - labels:            numpy array of shape (N,)
+        - future_covariates: optional numpy array of shape (N, n_future_features)
 
     __getitem__ returns:
-        X: torch.FloatTensor (seq_length, n_features)
-        y: torch.FloatTensor scalar (0.0 or 1.0)
+        If future_covariates is None:
+            X, y
+        else:
+            X_past, X_future, y
     """
 
-    def __init__(self, sequences: np.ndarray, labels: np.ndarray):
+    def __init__(
+        self,
+        sequences: np.ndarray,
+        labels: np.ndarray,
+        future_covariates: np.ndarray | None = None,
+    ):
         assert len(sequences) == len(labels), "Sequences and labels must have same length."
+
+        if future_covariates is not None:
+            assert len(future_covariates) == len(labels), (
+                "Future covariates and labels must have same length."
+            )
+            self.future_covariates = torch.from_numpy(future_covariates).float()
+        else:
+            self.future_covariates = None
+
         self.sequences = torch.from_numpy(sequences)  # float32
         self.labels = torch.from_numpy(labels).float()
 
@@ -361,7 +546,10 @@ class BTCTFTDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx: int):
-        return self.sequences[idx], self.labels[idx]
+        if self.future_covariates is None:
+            return self.sequences[idx], self.labels[idx]
+        else:
+            return self.sequences[idx], self.future_covariates[idx], self.labels[idx]
 
 
 # ============================
@@ -377,11 +565,13 @@ def prepare_datasets(
 
     1. Load BTC daily data.
     2. Add technical indicators.
-    3. Add target_up column.
-    4. Split by date into train / val / test.
-    5. Scale features.
-    6. Build sequences.
-    7. Wrap them into BTCTFTDataset objects.
+    3. Add calendar and halving-related base features.
+    4. Add next-day future covariate columns via shift(-1).
+    5. Add target_up column.
+    6. Split by date into train / val / test.
+    7. Scale features.
+    8. Build sequences (past) and per-sample future covariate vectors.
+    9. Wrap them into BTCTFTDataset objects.
 
     Returns:
         train_dataset, val_dataset, test_dataset, scalers_dict
@@ -392,10 +582,17 @@ def prepare_datasets(
     # 2. Add indicators
     df = add_technical_indicators(df)
 
-    # 3. Add up/down label
+    # 3. Add calendar and halving features (per day)
+    df = add_calendar_features(df)
+    df = add_halving_features(df)
+
+    # 4. Add next-day future covariate columns (will be used later for TFT)
+    df = add_future_covariates(df)
+
+    # 5. Add up/down label (this also drops the last row with NaNs)
     df = add_target_column(df, up_threshold=config.UP_THRESHOLD)
 
-    # Which columns we will feed into the model (from config)
+    # Which columns we will feed into the model as past covariates (from config)
     feature_cols = config.FEATURE_COLS
 
     # Make sure all required feature columns exist
@@ -403,23 +600,32 @@ def prepare_datasets(
         if col not in df.columns:
             raise ValueError(f"Feature column '{col}' is missing. Check indicator generation.")
 
-    # 4. Train/Val/Test split
+    # Future covariate columns (calendar + halving for t+1)
+    future_cols = config.FUTURE_COVARIATE_COLS
+
+    # 6. Train/Val/Test split
     train_df, val_df, test_df = split_by_date(df)
 
-    # 5. Scale features
+    # 7. Scale features (for past covariates)
     train_df_scaled, val_df_scaled, test_df_scaled, scalers = scale_features(
         train_df, val_df, test_df, feature_cols
     )
 
-    # 6. Build sequences
-    train_seq, train_labels = build_sequences(train_df_scaled, feature_cols, seq_length)
-    val_seq, val_labels     = build_sequences(val_df_scaled, feature_cols, seq_length)
-    test_seq, test_labels   = build_sequences(test_df_scaled, feature_cols, seq_length)
+    # 8. Build sequences + future covariate vectors
+    train_seq, train_labels, train_future = build_sequences(
+        train_df_scaled, feature_cols, seq_length, future_cols=future_cols
+    )
+    val_seq, val_labels, val_future = build_sequences(
+        val_df_scaled, feature_cols, seq_length, future_cols=future_cols
+    )
+    test_seq, test_labels, test_future = build_sequences(
+        test_df_scaled, feature_cols, seq_length, future_cols=future_cols
+    )
 
-    # 7. Wrap into Datasets
-    train_dataset = BTCTFTDataset(train_seq, train_labels)
-    val_dataset   = BTCTFTDataset(val_seq, val_labels)
-    test_dataset  = BTCTFTDataset(test_seq, test_labels)
+    # 9. Wrap into Datasets
+    train_dataset = BTCTFTDataset(train_seq, train_labels, train_future)
+    val_dataset   = BTCTFTDataset(val_seq, val_labels, val_future)
+    test_dataset  = BTCTFTDataset(test_seq, test_labels, test_future)
 
     return train_dataset, val_dataset, test_dataset, scalers
 
@@ -438,6 +644,7 @@ if __name__ == "__main__":
       - Inspect the first training sample:
           * its shape
           * its label (0.0 or 1.0)
+          * future covariate vector (if present)
           * first 3 timesteps of the sequence
           * last 3 timesteps of the sequence
           * last timestep with feature names
@@ -453,11 +660,19 @@ if __name__ == "__main__":
     print(f"Test samples:  {len(test_ds)}")
 
     # Take the first sample from the training set
-    x, y = train_ds[0]
+    sample = train_ds[0]
+
+    if len(sample) == 2:
+        x, y = sample
+        future = None
+    else:
+        x, future, y = sample
 
     # x shape: (seq_length, n_features)
-    print(f"One sample X shape: {x.shape}  (seq_length, n_features)")
-    print(f"One sample y: {y.item()} (0.0 or 1.0)")
+    print(f"One sample X shape:       {x.shape}  (seq_length, n_features)")
+    if future is not None:
+        print(f"One sample future shape:  {future.shape}  (n_future_features,)")
+    print(f"One sample y:             {y.item()} (0.0 or 1.0)")
 
     # Convert to numpy for nicer printing (still scaled values!)
     x_np = x.numpy()
@@ -490,5 +705,10 @@ if __name__ == "__main__":
     for i in range(n_features):
         fname = feature_names[i] if i < len(feature_names) else f"feat_{i}"
         print(f"    {fname:>12}: {last_step[i]: .4f}")
+
+    if future is not None:
+        print("\n  Future covariates for t+1 (raw values):")
+        print("    Values:", ", ".join(f"{v:.4f}" for v in future.numpy()))
+        print("    Columns:", ", ".join(config.FUTURE_COVARIATE_COLS))
 
     print("\n[data_pipeline] Self-test finished.")

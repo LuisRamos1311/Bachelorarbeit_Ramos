@@ -5,7 +5,7 @@ Central configuration for the TFT BTC up/down project.
 
 This file groups together:
 - Data paths and date ranges
-- Feature definitions
+- Feature definitions (past & known-future covariates)
 - Labeling rules (e.g. what counts as "up")
 - Model and training hyperparameters
 
@@ -56,6 +56,8 @@ SEQ_LENGTH = 30  # 30 days of history
 # If future_return > UP_THRESHOLD -> label = 1 (UP), else 0 (DOWN/FLAT)
 UP_THRESHOLD = 0.0
 
+# -------- Core price & indicator features (past covariates) --------
+
 # Price & volume columns that will be scaled with MinMaxScaler
 PRICE_VOLUME_COLS: List[str] = [
     "open",
@@ -76,7 +78,7 @@ INDICATOR_COLS: List[str] = [
     "rsi_14",
 ]
 
-# Full list of feature columns fed into the model (current "past covariates")
+# Full list of feature columns fed into the model as PAST covariates
 FEATURE_COLS: List[str] = PRICE_VOLUME_COLS + INDICATOR_COLS
 
 # (For the future) additional sentiment feature columns
@@ -89,7 +91,38 @@ SENTIMENT_COLS: List[str] = [
     # Fill these in when you implement sentiment_features.py
 ]
 
-# -------- Advanced TFT-style feature grouping (Phase 0 groundwork) --------
+# -------- Calendar & halving features (base + future) --------
+# Base (per-day) calendar features – attached to each date t.
+CALENDAR_COLS: List[str] = [
+    "day_of_week",   # 0=Monday, ..., 6=Sunday  (for day t)
+    "is_weekend",    # 1 if Saturday/Sunday, else 0 (for day t)
+    "month",         # 1–12 (for day t)
+]
+
+# Base halving-related features – attached to each date t.
+# These are computed from known / approximate halving dates.
+HALVING_COLS: List[str] = [
+    "is_halving_window",     # 1 if within ±N days of a halving, else 0
+    "days_to_next_halving",  # integer days from t to the next halving
+]
+
+# Future (t+1) versions that the model will use as known future covariates.
+# We create these from the base columns using shift(-1) in data_pipeline.py.
+FUTURE_CALENDAR_COLS: List[str] = [
+    "dow_next",           # day_of_week for t+1
+    "is_weekend_next",    # is_weekend for t+1
+    "month_next",         # month for t+1
+]
+
+FUTURE_HALVING_COLS: List[str] = [
+    "is_halving_window_next",  # halving-window flag for t+1
+    # You could also add "days_to_next_halving_next" if you want it later.
+]
+
+# All known future covariates (for now: calendar + halving for t+1).
+FUTURE_COVARIATE_COLS: List[str] = FUTURE_CALENDAR_COLS + FUTURE_HALVING_COLS
+
+# -------- Advanced TFT-style feature grouping --------
 # In the original TFT, inputs are split into:
 #   - static covariates       (do not change over time)
 #   - past time-varying       (observed up to "now")
@@ -98,9 +131,8 @@ SENTIMENT_COLS: List[str] = [
 # For now, we treat all existing FEATURE_COLS as past time-varying covariates.
 PAST_COVARIATE_COLS: List[str] = FEATURE_COLS.copy()
 
-# Known future inputs (e.g. calendar features like day_of_week, month) will go here.
-# Right now this is empty; we will populate it when we add simple future inputs.
-FUTURE_COVARIATE_COLS: List[str] = []
+# FUTURE_COVARIATE_COLS is defined above and already used in data_pipeline.py
+# to build per-sample future covariate vectors for t+1.
 
 # Static covariates (e.g. asset ID, regime label) – not used yet for single BTC.
 STATIC_COLS: List[str] = []
@@ -116,10 +148,12 @@ class ModelConfig:
     Hyperparameters for the Temporal Fusion Transformer-style model.
 
     Current implementation:
-    - input projection from raw features to hidden_size
+    - Variable Selection Network (VSN) or linear projection from raw features
+      to hidden_size
     - LSTM encoder over the past sequence
     - multi-head self-attention over the encoded sequence
-    - position-wise feed-forward network
+    - temporal feed-forward / gating blocks (GRNs with GLU)
+    - optional known future covariate encoder (calendar + halving for t+1)
     - final linear layer that outputs one logit for binary up/down
     """
 
@@ -141,17 +175,18 @@ class ModelConfig:
     # Hidden size of the position-wise feed-forward network
     ff_hidden_size: int = 128
 
-    # -------- Advanced TFT-style options (Phase 0 switches) --------
+    # -------- Advanced TFT-style options --------
 
-    # Use GRN + GLU gating around key submodules (we'll wire this in tft_model.py).
+    # Use GRN + GLU gating around key submodules.
     use_gating: bool = True
 
-    # Use Variable Selection Networks over past and future covariates.
+    # Use Variable Selection Networks over past covariates.
     use_variable_selection: bool = True
 
-    # Use known future covariates (e.g. calendar features).
-    # Initially False – we will enable it when we extend data_pipeline & model.
-    use_future_covariates: bool = False
+    # Use known future covariates (e.g. calendar & halving info for t+1).
+    # We will actually wire this into tft_model.py next; you can turn it off
+    # later for ablation experiments.
+    use_future_covariates: bool = True
 
     # Hidden size used inside variable selection networks (VSNs) and GRNs.
     variable_selection_hidden_size: int = 64
@@ -159,8 +194,8 @@ class ModelConfig:
     # Hidden size for potential static covariate encoders (multi-asset extension).
     static_hidden_size: int = 16
 
-    # Number of future-covariate features per time step.
-    # Computed from FUTURE_COVARIATE_COLS; currently 0.
+    # Number of future-covariate features for t+1.
+    # Computed from FUTURE_COVARIATE_COLS; currently 4.
     future_input_size: int = len(FUTURE_COVARIATE_COLS)
 
     # Placeholder for future extension with static covariates

@@ -4,15 +4,17 @@ tft_model.py
 Defines a simplified Temporal Fusion Transformer-style model for predicting
 next-day BTC up/down movements.
 
-Current architecture (with optional VSNs and gating):
+Current architecture (with optional VSNs, gating and known future inputs):
 
 1. Variable Selection Network (optional) or linear projection from raw input
    features to a shared hidden size.
 2. LSTM encoder over the past time steps.
 3. Multi-head self-attention over the encoded sequence.
 4. Temporal feed-forward / gating block (Gated Residual Networks).
-5. Aggregation over time (we use the last time step) and a final linear layer
-   to output a single logit for binary classification.
+5. Optional future covariate encoder (calendar + halving info for t+1).
+6. Aggregation over time (we use the last time step), fusion with future
+   context, and a final linear layer to output a single logit for
+   binary classification.
 
 Other modules (train_tft.py, evaluate_tft.py, etc.) should treat this as a
 standard PyTorch model:
@@ -248,11 +250,19 @@ class TemporalFusionTransformer(nn.Module):
     Simplified Temporal Fusion Transformer-style model.
 
     Expected input:
-        x: Tensor of shape (batch_size, seq_length, input_size)
+        x_past:
+            Tensor of shape (batch_size, seq_length, input_size)
+            Past covariates (OHLCV + indicators) as built in data_pipeline.py.
+        x_future:
+            Optional tensor of shape (batch_size, future_input_size)
+            Known future covariates for t+1 (calendar + halving), as built
+            in data_pipeline.py. If config.MODEL_CONFIG.use_future_covariates
+            is True, x_future must be provided.
 
     Output:
-        logits: Tensor of shape (batch_size, output_size)
-                For this project, output_size = 1 (binary up/down logit).
+        logits:
+            Tensor of shape (batch_size, output_size)
+            For this project, output_size = 1 (binary up/down logit).
 
     If return_attention=True, the forward pass also returns the attention
     weights from the multi-head attention layer, which can be used later
@@ -265,6 +275,9 @@ class TemporalFusionTransformer(nn.Module):
         - use_variable_selection:
             If True, use a Variable Selection Network over past covariates
             instead of a single linear input projection.
+        - use_future_covariates:
+            If True, encode x_future and fuse it with the temporal summary
+            before the final output layer.
     """
 
     def __init__(self, model_config: config.ModelConfig | None = None) -> None:
@@ -366,21 +379,66 @@ class TemporalFusionTransformer(nn.Module):
             )
             self.ffn_layer_norm = nn.LayerNorm(hidden_size)
 
-        # -------- 5. Output layer --------
-        # We will aggregate over time (take last time step) and map the
-        # hidden_size vector to a single logit for up/down.
+        # -------- 5. Future covariate encoder (optional) --------
+        # Encodes known future covariates (calendar + halving info for t+1)
+        # into a hidden_size context vector.
+        if self.config.use_future_covariates and self.config.future_input_size > 0:
+            if self.config.use_gating:
+                # GRN-based encoder for future covariates
+                self.future_encoder = GatedResidualNetwork(
+                    input_size=self.config.future_input_size,
+                    hidden_size=self.config.variable_selection_hidden_size,
+                    output_size=hidden_size,
+                    dropout=dropout,
+                )
+            else:
+                # Simple linear projection when gating is disabled
+                self.future_encoder = nn.Sequential(
+                    nn.Linear(self.config.future_input_size, hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
+        else:
+            self.future_encoder = None
+
+        # GRN (or linear) to fuse temporal summary with future context
+        if self.config.use_future_covariates and self.config.use_gating:
+            self.decision_grn = GatedResidualNetwork(
+                input_size=hidden_size,
+                hidden_size=self.config.ff_hidden_size,
+                output_size=hidden_size,
+                dropout=dropout,
+            )
+        elif self.config.use_future_covariates and not self.config.use_gating:
+            # When gating is off, we'll concatenate and use a linear layer
+            self.decision_linear = nn.Linear(
+                hidden_size + hidden_size, hidden_size
+            )
+
+        # -------- 6. Output layer --------
+        # We will aggregate over time (take last time step), optionally fuse
+        # with future covariates, and map the hidden_size vector to a single
+        # logit for up/down.
         self.output_layer = nn.Linear(hidden_size, self.config.output_size)
 
     def forward(
-        self, x: torch.Tensor, return_attention: bool = False
+        self,
+        x_past: torch.Tensor,
+        x_future: torch.Tensor | None = None,
+        return_attention: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the TFT model.
 
         Args:
-            x:
-                Input tensor of shape (batch_size, seq_length, input_size).
+            x_past:
+                Past covariates, tensor of shape (batch_size, seq_length, input_size).
                 This should match the sequences created in data_pipeline.py.
+            x_future:
+                Future covariates for t+1, tensor of shape
+                (batch_size, future_input_size). If
+                config.MODEL_CONFIG.use_future_covariates is True, this must
+                be provided. If the flag is False, x_future is ignored.
             return_attention:
                 If True, also return the attention weights from the
                 multi-head attention layer. This is useful for later
@@ -396,8 +454,8 @@ class TemporalFusionTransformer(nn.Module):
                 attention weights over time. Only returned if
                 return_attention=True.
         """
-        # x: (B, T, input_size)
-        batch_size, seq_length, input_size = x.shape
+        # x_past: (B, T, F)
+        batch_size, seq_length, input_size = x_past.shape
 
         if input_size != self.config.input_size:
             raise ValueError(
@@ -405,15 +463,41 @@ class TemporalFusionTransformer(nn.Module):
                 f"but got {input_size}. Check FEATURE_COLS and ModelConfig."
             )
 
+        # Check / handle future covariates
+        if self.config.use_future_covariates:
+            if self.future_encoder is None or self.config.future_input_size <= 0:
+                raise RuntimeError(
+                    "use_future_covariates=True but future_encoder is not set or "
+                    "future_input_size <= 0. Check config.FUTURE_COVARIATE_COLS "
+                    "and ModelConfig.future_input_size."
+                )
+            if x_future is None:
+                raise ValueError(
+                    "x_future must be provided when use_future_covariates=True."
+                )
+            if x_future.shape[0] != batch_size:
+                raise ValueError(
+                    f"x_future batch dimension {x_future.shape[0]} does not match "
+                    f"x_past batch dimension {batch_size}."
+                )
+            if x_future.shape[1] != self.config.future_input_size:
+                raise ValueError(
+                    f"Expected x_future.shape[1]={self.config.future_input_size}, "
+                    f"but got {x_future.shape[1]}. Check FUTURE_COVARIATE_COLS."
+                )
+        else:
+            # Ignore x_future if not used
+            x_future = None
+
         # ---- Step 1: Variable selection or simple projection ----
         if self.config.use_variable_selection:
             # x_proj: (B, T, H), vsn_weights: (B, T, F)
-            x_proj, vsn_weights = self.vsn_past(x)
+            x_proj, vsn_weights = self.vsn_past(x_past)
             # Store for potential interpretability later
             self.last_vsn_weights = vsn_weights
         else:
             # Plain linear projection: (B, T, F) -> (B, T, H)
-            x_proj = self.input_projection(x)
+            x_proj = self.input_projection(x_past)
             self.last_vsn_weights = None
 
         # ---- Step 2: LSTM encoder ----
@@ -460,8 +544,31 @@ class TemporalFusionTransformer(nn.Module):
         # last_timestep: (B, H)
         last_timestep = ff_out[:, -1, :]
 
+        # ---- Step 6: Fuse with future covariates (if used) ----
+        if self.config.use_future_covariates and x_future is not None:
+            # Encode future covariates to a context vector: (B, H)
+            if self.config.use_gating:
+                future_context = self.future_encoder(x_future)  # GRN encoder
+            else:
+                future_context = self.future_encoder(x_future)  # linear encoder
+
+            # Fuse temporal summary and future context.
+            if self.config.use_gating:
+                # Use a GRN with future_context as "context" input.
+                fused = self.decision_grn(last_timestep, context=future_context)
+            else:
+                # Concatenate and project back to hidden_size.
+                combined = torch.cat([last_timestep, future_context], dim=-1)
+                fused = self.decision_linear(combined)
+
+            fusion_output = fused
+        else:
+            # No future covariates used: keep last_timestep as final representation.
+            fusion_output = last_timestep
+
+        # ---- Step 7: Final output layer ----
         # Map to final logits: (B, 1)
-        logits = self.output_layer(last_timestep)
+        logits = self.output_layer(fusion_output)
 
         if return_attention:
             return logits, attn_weights
@@ -476,19 +583,35 @@ if __name__ == "__main__":
     # Use settings from config.py
     seq_length = config.SEQ_LENGTH
     input_size = config.MODEL_CONFIG.input_size
+    future_input_size = config.MODEL_CONFIG.future_input_size
 
     batch_size = 4
-    dummy_x = torch.randn(batch_size, seq_length, input_size)
+    dummy_x_past = torch.randn(batch_size, seq_length, input_size)
+
+    if config.MODEL_CONFIG.use_future_covariates and future_input_size > 0:
+        dummy_x_future = torch.randn(batch_size, future_input_size)
+    else:
+        dummy_x_future = None
 
     model = TemporalFusionTransformer()
-    logits, attn_weights = model(dummy_x, return_attention=True)
 
-    print("Input shape:         ", dummy_x.shape)       # (B, T, input_size)
-    print("Logits shape:        ", logits.shape)        # (B, 1)
-    print("Attention shape:     ", attn_weights.shape)  # (B, T, T)
-    print("Config.use_gating:   ", config.MODEL_CONFIG.use_gating)
-    print("Config.use_VSN:      ", config.MODEL_CONFIG.use_variable_selection)
-    if model.last_vsn_weights is not None:
-        print("VSN weights shape:   ", model.last_vsn_weights.shape)  # (B, T, F)
+    logits, attn_weights = model(
+        dummy_x_past,
+        x_future=dummy_x_future,
+        return_attention=True,
+    )
+
+    print("Input (past) shape:   ", dummy_x_past.shape)       # (B, T, input_size)
+    if dummy_x_future is not None:
+        print("Input (future) shape: ", dummy_x_future.shape)   # (B, F_future)
     else:
-        print("VSN weights:         None (variable selection disabled)")
+        print("Input (future):       None")
+    print("Logits shape:          ", logits.shape)            # (B, 1)
+    print("Attention shape:       ", attn_weights.shape)      # (B, T, T)
+    print("Config.use_gating:     ", config.MODEL_CONFIG.use_gating)
+    print("Config.use_VSN:        ", config.MODEL_CONFIG.use_variable_selection)
+    print("Config.use_future_covs:", config.MODEL_CONFIG.use_future_covariates)
+    if model.last_vsn_weights is not None:
+        print("VSN weights shape:    ", model.last_vsn_weights.shape)  # (B, T, F)
+    else:
+        print("VSN weights:          None (variable selection disabled)")
