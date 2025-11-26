@@ -232,7 +232,7 @@ class TrainingConfig:
 
     # Initial classification threshold on the sigmoid output.
     # You can tune this later on the validation set.
-    threshold: float = 0.5
+    threshold: float = 0.05
 
 
 TRAINING_CONFIG = TrainingConfig()

@@ -4,15 +4,17 @@ evaluate_tft.py
 Phase 4: Evaluate the trained Temporal Fusion Transformer (TFT)
 on the held-out test period and generate thesis-ready plots.
 
-This script:
+This script now:
 - Rebuilds datasets via data_pipeline.prepare_datasets()
 - Loads the best saved TFT model from models/
-- Runs inference on the test set
+- Runs inference on the *validation* set to tune the decision threshold (grid search)
+- Uses the best validation threshold to evaluate the *test* set
 - Computes final metrics (accuracy, precision, recall, F1, AUC)
 - Saves:
     * test metrics as JSON under experiments/
     * confusion matrix plot under plots/
     * ROC curve plot under plots/
+    * probability histograms for val/test under plots/
 """
 
 from __future__ import annotations
@@ -22,8 +24,10 @@ import os
 import time
 from typing import Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
 
 from config import (
     MODEL_CONFIG,
@@ -37,81 +41,43 @@ from tft_model import TemporalFusionTransformer
 import utils
 
 
-def create_test_dataloader(test_dataset, batch_size: int) -> DataLoader:
+def create_eval_dataloader(dataset, batch_size: int) -> DataLoader:
     """
-    Wrap the test dataset into a DataLoader (no shuffling).
+    Wrap a dataset into a DataLoader (no shuffling, no drop_last).
+    Used for both validation and test sets.
     """
-    test_loader = DataLoader(
-        test_dataset,
+    loader = DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
     )
-    return test_loader
+    return loader
 
 
-def main() -> None:
-    # -------------------------
-    # 1. Reproducibility & device
-    # -------------------------
-    utils.set_seed(TRAINING_CONFIG.seed)
-    device = utils.get_device()
-    print(f"[evaluate_tft] Using device: {device}")
+def run_inference(
+    model: torch.nn.Module,
+    data_loader: DataLoader,
+    criterion: torch.nn.Module,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    Run forward passes over an evaluation DataLoader and collect:
+        - all true labels (1D tensor)
+        - all predicted probabilities (1D tensor)
+        - average BCE loss
 
-    # Ensure output directories exist
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-
-    # -------------------------
-    # 2. Build datasets & test loader
-    # -------------------------
-    print("[evaluate_tft] Preparing datasets...")
-    train_ds, val_ds, test_ds, scalers = prepare_datasets()
-    print(f"[evaluate_tft] Train samples: {len(train_ds)}")
-    print(f"[evaluate_tft] Val samples:   {len(val_ds)}")
-    print(f"[evaluate_tft] Test samples:  {len(test_ds)}")
-
-    test_loader = create_test_dataloader(
-        test_dataset=test_ds,
-        batch_size=TRAINING_CONFIG.batch_size,
-    )
-
-    # -------------------------
-    # 3. Load best model
-    # -------------------------
-    best_model_path = os.path.join(MODELS_DIR, "tft_btc_best.pth")
-    if not os.path.exists(best_model_path):
-        raise FileNotFoundError(
-            f"Best model file not found at {best_model_path}. "
-            f"Make sure you ran train_tft.py and it saved the model."
-        )
-
-    print(f"[evaluate_tft] Loading model from {best_model_path} ...")
-    model = TemporalFusionTransformer(MODEL_CONFIG).to(device)
-    state_dict = torch.load(best_model_path, map_location=device)
-    model.load_state_dict(state_dict)
+    This works for both validation and test sets.
+    """
     model.eval()
-
-    # Use the same loss as in training (for reference)
-    if TRAINING_CONFIG.pos_weight != 1.0:
-        pos_weight = torch.tensor([TRAINING_CONFIG.pos_weight], device=device)
-        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    else:
-        criterion = torch.nn.BCEWithLogitsLoss()
-
-    # -------------------------
-    # 4. Run inference on test set
-    # -------------------------
-    print("[evaluate_tft] Running inference on test set...")
 
     all_true = []
     all_prob = []
     total_loss = 0.0
-    num_samples = len(test_ds)
+    num_samples = len(data_loader.dataset)
 
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in data_loader:
             # Batch can be:
             #   - (x_past, y)
             #   - (x_past, x_future, y)
@@ -138,48 +104,220 @@ def main() -> None:
             all_true.append(y.detach().cpu().view(-1))
 
     if num_samples == 0:
-        raise ValueError("Test dataset is empty. Check your date ranges and pipeline.")
+        raise ValueError("Dataset is empty. Check your date ranges and pipeline.")
 
     all_true_tensor = torch.cat(all_true)
     all_prob_tensor = torch.cat(all_prob)
-
     avg_loss = total_loss / num_samples
 
-    # -------------------------
-    # 5. Compute metrics
-    # -------------------------
-    threshold = TRAINING_CONFIG.threshold
-    metrics = utils.compute_classification_metrics(
-        y_true=all_true_tensor,
-        y_prob=all_prob_tensor,
-        threshold=threshold,
-    )
-    metrics["loss"] = float(avg_loss)
+    return all_true_tensor, all_prob_tensor, avg_loss
 
-    print("\n[evaluate_tft] Test metrics:")
-    print(f"  Test loss:      {metrics['loss']:.4f}")
-    print(f"  Accuracy:       {metrics['accuracy']:.4f}")
-    print(f"  Precision:      {metrics['precision']:.4f}")
-    print(f"  Recall:         {metrics['recall']:.4f}")
-    print(f"  F1-score:       {metrics['f1']:.4f}")
-    print(f"  ROC AUC:        {metrics['auc']:.4f}")
-    print(f"  Threshold used: {threshold:.3f}")
+
+def plot_probability_histogram(
+    y_prob: torch.Tensor,
+    out_path: str,
+    threshold: float | None = None,
+    title: str = "Predicted probabilities",
+    bins: int = 30,
+) -> None:
+    """
+    Plot and save a histogram of predicted probabilities.
+
+    Args:
+        y_prob:
+            1D tensor of probabilities for the positive class (after sigmoid).
+        out_path:
+            File path (PNG) where the plot will be saved.
+        threshold:
+            Optional vertical line showing the classification threshold.
+        title:
+            Plot title.
+        bins:
+            Number of histogram bins.
+    """
+    probs = y_prob.detach().cpu().numpy()
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.hist(probs, bins=bins, color="steelblue", edgecolor="black", alpha=0.7)
+    ax.set_xlabel("Predicted probability (UP class)")
+    ax.set_ylabel("Count")
+    ax.set_title(title)
+
+    if threshold is not None:
+        ax.axvline(threshold, color="red", linestyle="--", label=f"Threshold = {threshold:.2f}")
+        ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def main() -> None:
+    # -------------------------
+    # 1. Reproducibility & device
+    # -------------------------
+    utils.set_seed(TRAINING_CONFIG.seed)
+    device = utils.get_device()
+    print(f"[evaluate_tft] Using device: {device}")
+
+    # Ensure output directories exist
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
+    os.makedirs(PLOTS_DIR, exist_ok=True)
 
     # -------------------------
-    # 6. Save metrics & plots
+    # 2. Build datasets & loaders
     # -------------------------
+    print("[evaluate_tft] Preparing datasets...")
+    train_ds, val_ds, test_ds, scalers = prepare_datasets()
+    print(f"[evaluate_tft] Train samples: {len(train_ds)}")
+    print(f"[evaluate_tft] Val samples:   {len(val_ds)}")
+    print(f"[evaluate_tft] Test samples:  {len(test_ds)}")
+
+    batch_size = TRAINING_CONFIG.batch_size
+    val_loader = create_eval_dataloader(val_ds, batch_size=batch_size)
+    test_loader = create_eval_dataloader(test_ds, batch_size=batch_size)
+
+    # -------------------------
+    # 3. Load best model
+    # -------------------------
+    best_model_path = os.path.join(MODELS_DIR, "tft_btc_best.pth")
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(
+            f"Best model file not found at {best_model_path}. "
+            f"Make sure you ran train_tft.py and it saved the model."
+        )
+
+    print(f"[evaluate_tft] Loading model from {best_model_path} ...")
+    model = TemporalFusionTransformer(MODEL_CONFIG).to(device)
+    state_dict = torch.load(best_model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    # Use the same loss as in training (for reference)
+    if TRAINING_CONFIG.pos_weight != 1.0:
+        pos_weight = torch.tensor([TRAINING_CONFIG.pos_weight], device=device)
+        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        print(f"[evaluate_tft] Using BCEWithLogitsLoss with pos_weight={TRAINING_CONFIG.pos_weight}")
+    else:
+        criterion = torch.nn.BCEWithLogitsLoss()
+        print("[evaluate_tft] Using BCEWithLogitsLoss with pos_weight=1.0")
+
+    # Unique run ID for outputs
     run_id = time.strftime("tft_eval_%Y%m%d_%H%M%S")
 
+    # =======================================================
+    # 4. Threshold tuning on validation set (maximize F1)
+    # =======================================================
+    print("[evaluate_tft] Running inference on validation set for threshold tuning...")
+    val_true, val_prob, val_loss = run_inference(
+        model=model,
+        data_loader=val_loader,
+        criterion=criterion,
+        device=device,
+    )
+
+    # Grid of thresholds: 0.05, 0.10, ..., 0.85
+    threshold_grid = [0.05 * i for i in range(1, 18)]
+
+    best_threshold = None
+    best_f1 = -1.0
+    best_val_metrics = None
+
+    for th in threshold_grid:
+        m = utils.compute_classification_metrics(
+            y_true=val_true,
+            y_prob=val_prob,
+            threshold=th,
+        )
+        if m["f1"] > best_f1:
+            best_f1 = m["f1"]
+            best_threshold = th
+            best_val_metrics = m
+
+    if best_threshold is None:
+        raise RuntimeError("Threshold search failed – no thresholds evaluated.")
+
+    # Attach loss for completeness
+    best_val_metrics["loss"] = float(val_loss)
+
+    print("\n[evaluate_tft] Validation threshold search (optimize F1):")
+    print(f"  Best threshold on val: {best_threshold:.3f}")
+    print(f"  Val F1 at best thres.: {best_f1:.4f}")
+    print(f"  Val accuracy:          {best_val_metrics['accuracy']:.4f}")
+    print(f"  Val precision:         {best_val_metrics['precision']:.4f}")
+    print(f"  Val recall:            {best_val_metrics['recall']:.4f}")
+    print(f"  Val loss:              {best_val_metrics['loss']:.4f}")
+
+    # -------------------------
+    # 4a. Plot validation probability distribution
+    # -------------------------
+    val_hist_path = os.path.join(PLOTS_DIR, f"{run_id}_val_prob_hist.png")
+    plot_probability_histogram(
+        y_prob=val_prob,
+        out_path=val_hist_path,
+        threshold=best_threshold,
+        title="Predicted UP probabilities (validation)",
+    )
+    print(f"[evaluate_tft] Validation probability histogram saved to {val_hist_path}")
+
+    # =======================================================
+    # 5. Final evaluation on TEST set using tuned threshold
+    # =======================================================
+    print("\n[evaluate_tft] Running inference on test set with tuned threshold...")
+    test_true, test_prob, test_loss = run_inference(
+        model=model,
+        data_loader=test_loader,
+        criterion=criterion,
+        device=device,
+    )
+
+    test_metrics = utils.compute_classification_metrics(
+        y_true=test_true,
+        y_prob=test_prob,
+        threshold=best_threshold,
+    )
+    test_metrics["loss"] = float(test_loss)
+    test_metrics["threshold"] = float(best_threshold)
+    # Also log the validation F1 used to pick this threshold
+    test_metrics["val_f1_at_threshold"] = float(best_f1)
+
+    print("\n[evaluate_tft] Test metrics (using tuned threshold):")
+    print(f"  Test loss:      {test_metrics['loss']:.4f}")
+    print(f"  Accuracy:       {test_metrics['accuracy']:.4f}")
+    print(f"  Precision:      {test_metrics['precision']:.4f}")
+    print(f"  Recall:         {test_metrics['recall']:.4f}")
+    print(f"  F1-score:       {test_metrics['f1']:.4f}")
+    print(f"  ROC AUC:        {test_metrics['auc']:.4f}")
+    print(f"  Threshold used: {best_threshold:.3f}")
+
+    # -------------------------
+    # 5a. Plot test probability distribution
+    # -------------------------
+    test_hist_path = os.path.join(PLOTS_DIR, f"{run_id}_test_prob_hist.png")
+    plot_probability_histogram(
+        y_prob=test_prob,
+        out_path=test_hist_path,
+        threshold=best_threshold,
+        title="Predicted UP probabilities (test)",
+    )
+    print(f"[evaluate_tft] Test probability histogram saved to {test_hist_path}")
+
+    # -------------------------
+    # 6. Save metrics & plots (TEST)
+    # -------------------------
     # 6.1 Save metrics JSON
     metrics_path = os.path.join(EXPERIMENTS_DIR, f"{run_id}_test_metrics.json")
     with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(test_metrics, f, indent=2)
     print(f"[evaluate_tft] Test metrics saved to {metrics_path}")
 
-    # 6.2 Confusion matrix & ROC plots
-    y_true_np = all_true_tensor.cpu().numpy()
-    y_prob_np = all_prob_tensor.cpu().numpy()
-    y_pred_np = (y_prob_np >= threshold).astype(int)
+    # 6.2 Confusion matrix & ROC plots (on TEST set)
+    y_true_np = test_true.cpu().numpy()
+    y_prob_np = test_prob.cpu().numpy()
+    y_pred_np = (y_prob_np >= best_threshold).astype(int)
 
     cm_path = os.path.join(PLOTS_DIR, f"{run_id}_confusion_matrix.png")
     utils.plot_confusion_matrix(
