@@ -89,21 +89,6 @@ Steps to do this
 At this stage, once coded, you’d still call:
 model(x) with the same input/output shapes as now.
 
+After the first experiment the project only predicted ups when only 24% of them were actually ups.
 
-
-
-
-Created data_pipeline
-Test prints:
-dataset sizes
-shape of the first sample
-its label
-first 3 timesteps of that sequence
-detailed last timestep with feature names
-it additionally prints the last 3 timesteps of the same sequence
-This just helps you see how the window starts and how it ends 
-(how indicators and prices evolve over the 30 days). 
-It doesn’t change any data, it’s only for inspection and understanding.
-
-Trying to expand the project to add tools that differentiate tft from others
-GRNs, VSNs, known future inputs (this couldve probably have been done in the end)
+First Experiment is going to be tuning the treshold to try to get a better result

@@ -236,3 +236,39 @@ class TrainingConfig:
 
 
 TRAINING_CONFIG = TrainingConfig()
+
+# ============================
+# 6. EVALUATION / ARTIFACT DEFAULTS
+# ============================
+
+# Name of the file where the best model (by validation F1) is saved.
+BEST_MODEL_NAME: str = "tft_btc_best.pth"
+
+# Full path to the best-model checkpoint (used by both training & evaluation).
+BEST_MODEL_PATH: str = os.path.join(MODELS_DIR, BEST_MODEL_NAME)
+
+# Default threshold to use during final evaluation on the test set.
+# For now we keep it equal to the training threshold, but you can
+# override this later if you tune a better threshold on the validation set.
+EVAL_THRESHOLD: float = TRAINING_CONFIG.threshold
+
+# ----------------------------
+# Threshold tuning configuration
+# ----------------------------
+
+# If True, evaluate_tft.py will:
+#   1) Run the model on the *validation* set,
+#   2) Grid-search over a range of thresholds,
+#   3) Pick the threshold that maximizes THRESHOLD_TARGET_METRIC
+#      on the validation set,
+#   4) Use that threshold for computing test metrics.
+AUTO_TUNE_THRESHOLD: bool = True
+
+# Range of thresholds to search over [min, max] (inclusive, via linspace).
+THRESHOLD_SEARCH_MIN: float = 0.10
+THRESHOLD_SEARCH_MAX: float = 0.90
+THRESHOLD_SEARCH_STEPS: int = 17  # e.g. 0.10, 0.15, ..., 0.90
+
+# Which metric to maximize during tuning: "f1", "accuracy",
+# "precision", or "recall".
+THRESHOLD_TARGET_METRIC: str = "f1"

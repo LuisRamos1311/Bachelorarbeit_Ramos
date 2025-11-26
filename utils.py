@@ -7,7 +7,7 @@ This module provides:
 - Reproducibility helpers (set_seed)
 - Device selection (get_device)
 - Basic classification metrics computation for training & evaluation
-- Plotting helpers for training curves
+- Plotting helpers for training curves, confusion matrix, and ROC curve
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     roc_auc_score,
+    confusion_matrix,
+    roc_curve,
 )
 import matplotlib.pyplot as plt
 
@@ -202,6 +204,109 @@ def plot_training_curves(history: Dict[str, list], out_path: str) -> None:
         ax2.legend()
     else:
         ax2.set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_confusion_matrix(
+    y_true: Any,
+    y_pred: Any,
+    out_path: str,
+    labels: tuple[str, str] = ("DOWN", "UP"),
+) -> None:
+    """
+    Plot and save a confusion matrix for binary classification.
+
+    Args:
+        y_true:
+            True labels (0 or 1).
+        y_pred:
+            Predicted labels (0 or 1).
+        out_path:
+            File path (PNG) where the plot will be saved.
+        labels:
+            Class label names for display (negative_class, positive_class).
+    """
+    y_true_arr = _to_numpy_1d(y_true)
+    y_pred_arr = _to_numpy_1d(y_pred)
+
+    cm = confusion_matrix(y_true_arr, y_pred_arr)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+
+    ax.set(
+        xticks=np.arange(cm.shape[1]),
+        yticks=np.arange(cm.shape[0]),
+        xticklabels=labels,
+        yticklabels=labels,
+        ylabel="True label",
+        xlabel="Predicted label",
+        title="Confusion Matrix",
+    )
+
+    # Rotate x-axis tick labels
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    # Annotate each cell with its count
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(
+                j,
+                i,
+                format(cm[i, j], "d"),
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > thresh else "black",
+            )
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_roc_curve(
+    y_true: Any,
+    y_prob: Any,
+    out_path: str,
+) -> None:
+    """
+    Plot and save the ROC curve for binary classification.
+
+    Args:
+        y_true:
+            True labels (0 or 1).
+        y_prob:
+            Predicted probabilities for the positive class in [0, 1].
+        out_path:
+            File path (PNG) where the plot will be saved.
+    """
+    y_true_arr = _to_numpy_1d(y_true)
+    y_prob_arr = _to_numpy_1d(y_prob)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # Compute ROC points
+    fpr, tpr, _ = roc_curve(y_true_arr, y_prob_arr)
+    try:
+        auc = roc_auc_score(y_true_arr, y_prob_arr)
+    except ValueError:
+        auc = float("nan")
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.plot(fpr, tpr, label=f"ROC curve (AUC = {auc:.3f})")
+    ax.plot([0, 1], [0, 1], "k--", label="Random baseline")
+
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve")
+    ax.legend(loc="lower right")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
