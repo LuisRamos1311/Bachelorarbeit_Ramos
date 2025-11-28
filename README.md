@@ -88,7 +88,3 @@ Steps to do this
         Then optionally extend gating to other parts.
 At this stage, once coded, you’d still call:
 model(x) with the same input/output shapes as now.
-
-After the first experiment the project only predicted ups when only 24% of them were actually ups.
-
-First Experiment is going to be tuning the treshold to try to get a better result

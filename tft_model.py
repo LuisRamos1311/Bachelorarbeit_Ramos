@@ -16,7 +16,7 @@ Current architecture (with optional VSNs, gating and known future inputs):
    context, and a final linear layer to output a single logit for
    binary classification.
 
-Other modules (train_tft.py, evaluate_tft.py, etc.) should treat this as a
+Other modules (train_tft.py, evaluate_tft_posweight_experiment.py, etc.) should treat this as a
 standard PyTorch model:
 
     from tft_model import TemporalFusionTransformer

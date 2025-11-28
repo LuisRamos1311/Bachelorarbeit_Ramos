@@ -179,6 +179,7 @@ def main() -> None:
     # -------------------------
     # 1. Reproducibility & device
     # -------------------------
+
     utils.set_seed(TRAINING_CONFIG.seed)
     device = utils.get_device()
     print(f"[train_tft] Using device: {device}")
@@ -188,9 +189,11 @@ def main() -> None:
     os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
     os.makedirs(PLOTS_DIR, exist_ok=True)
 
+
     # -------------------------
     # 2. Build datasets & loaders
     # -------------------------
+
     print("[train_tft] Preparing datasets...")
     train_ds, val_ds, test_ds, scalers = prepare_datasets()
 
@@ -198,6 +201,52 @@ def main() -> None:
     print(f"[train_tft] Val samples:   {len(val_ds)}")
     print(f"[train_tft] Test samples:  {len(test_ds)}")
 
+    # -------------------------
+    # 2a. Class balance & pos_weight
+    # -------------------------
+
+    # train_ds.labels is a 1D torch tensor of 0.0 / 1.0 on CPU (from BTCTFTDataset)
+    train_labels_np = train_ds.labels.numpy()
+    num_pos = float((train_labels_np == 1.0).sum())
+    num_neg = float((train_labels_np == 0.0).sum())
+    total = num_pos + num_neg
+
+    if total == 0:
+        raise ValueError("[train_tft] Training set has zero samples; check your splits.")
+
+    pos_frac = num_pos / total
+    print(
+        f"[train_tft] Class balance (train): "
+        f"negatives={int(num_neg)}, positives={int(num_pos)} "
+        f"(pos_frac={pos_frac:.4f})"
+    )
+
+    # Decide which pos_weight to use according to config semantics
+    if TRAINING_CONFIG.pos_weight < 0:
+        # Auto-compute from data
+        if num_pos == 0:
+            raise ValueError(
+                "[train_tft] No positive samples in training set; cannot compute pos_weight."
+            )
+        pos_weight_value = num_neg / num_pos
+        TRAINING_CONFIG.pos_weight = float(pos_weight_value)  # store for reference
+        print(
+            f"[train_tft] Auto-computed pos_weight={pos_weight_value:.4f} "
+            f"(= #neg / #pos on training labels)."
+        )
+    elif TRAINING_CONFIG.pos_weight == 1.0:
+        # Explicitly no re-weighting
+        pos_weight_value = 1.0
+        print("[train_tft] Using unweighted BCE (pos_weight=1.0 from config).")
+    else:
+        # User-specified fixed value
+        pos_weight_value = float(TRAINING_CONFIG.pos_weight)
+        print(
+            f"[train_tft] Using manual pos_weight from config: "
+            f"{pos_weight_value:.4f}"
+        )
+
+    # Now we can build DataLoaders as before
     batch_size = TRAINING_CONFIG.batch_size
     train_loader, val_loader = create_dataloaders(
         train_dataset=train_ds,
@@ -205,21 +254,22 @@ def main() -> None:
         batch_size=batch_size,
     )
 
+
     # -------------------------
     # 3. Model, loss, optimizer
     # -------------------------
+
     print("[train_tft] Initializing model...")
     model = TemporalFusionTransformer(MODEL_CONFIG).to(device)
 
-    # Binary classification with logits
-    # By default we use the pos_weight from TRAINING_CONFIG.
-    if TRAINING_CONFIG.pos_weight != 1.0:
-        pos_weight = torch.tensor([TRAINING_CONFIG.pos_weight], device=device)
-        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        print(f"[train_tft] Using custom pos_weight: {TRAINING_CONFIG.pos_weight}")
-    else:
+    # Binary classification with logits, using the pos_weight we decided above
+    if pos_weight_value == 1.0:
         criterion = torch.nn.BCEWithLogitsLoss()
-        print("[train_tft] Using BCEWithLogitsLoss with pos_weight=1.0")
+        print("[train_tft] Using BCEWithLogitsLoss with pos_weight=1.0 (no reweighting).")
+    else:
+        pos_weight_tensor = torch.tensor([pos_weight_value], device=device)
+        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+        print(f"[train_tft] Using BCEWithLogitsLoss with pos_weight={pos_weight_value:.4f}")
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -229,9 +279,11 @@ def main() -> None:
 
     print(model)  # optional: prints architecture
 
+
     # -------------------------
     # 4. Training loop
     # -------------------------
+
     num_epochs = TRAINING_CONFIG.num_epochs
     threshold = TRAINING_CONFIG.threshold
 
@@ -326,9 +378,11 @@ def main() -> None:
     print("\n[train_tft] Training finished.")
     print(f"[train_tft] Best Val F1: {best_val_f1:.4f}")
 
+
     # -------------------------
     # 5. Save experiment history & training curves
     # -------------------------
+
     run_id = time.strftime("tft_run_%Y%m%d_%H%M%S")
 
     # Save history as JSON

@@ -1,11 +1,12 @@
 """
-evaluate_tft.py
+evaluate_tft_posweight_experiment.py
 
-Evaluate the trained Temporal Fusion Transformer (TFT)
+Phase 4: Evaluate the trained Temporal Fusion Transformer (TFT)
 on the held-out test period and generate thesis-ready plots.
 
-This script:
+This script now:
 - Rebuilds datasets via data_pipeline.prepare_datasets()
+- Computes class balance & pos_weight from training labels (if configured)
 - Loads the best saved TFT model from models/
 - Runs inference on the *validation* set to tune the decision threshold (grid search)
 - Uses the best validation threshold to evaluate the *test* set
@@ -176,6 +177,48 @@ def main() -> None:
     print(f"[evaluate_tft] Val samples:   {len(val_ds)}")
     print(f"[evaluate_tft] Test samples:  {len(test_ds)}")
 
+    # -------------------------
+    # 2a. Class balance & pos_weight (mirror train_tft logic)
+    # -------------------------
+    train_labels_np = train_ds.labels.numpy()
+    num_pos = float((train_labels_np == 1.0).sum())
+    num_neg = float((train_labels_np == 0.0).sum())
+    total = num_pos + num_neg
+
+    if total == 0:
+        raise ValueError("[evaluate_tft] Training set has zero samples; check your splits.")
+
+    pos_frac = num_pos / total
+    print(
+        f"[evaluate_tft] Class balance (train): "
+        f"negatives={int(num_neg)}, positives={int(num_pos)} "
+        f"(pos_frac={pos_frac:.4f})"
+    )
+
+    # Same semantics as we used in train_tft:
+    #   - TRAINING_CONFIG.pos_weight < 0  -> auto compute (#neg / #pos)
+    #   - TRAINING_CONFIG.pos_weight == 1 -> no re-weighting
+    #   - otherwise                      -> fixed manual value
+    if TRAINING_CONFIG.pos_weight < 0:
+        if num_pos == 0:
+            raise ValueError(
+                "[evaluate_tft] No positive samples in training set; cannot compute pos_weight."
+            )
+        pos_weight_value = num_neg / num_pos
+        print(
+            f"[evaluate_tft] Auto-computed pos_weight={pos_weight_value:.4f} "
+            f"(= #neg / #pos on training labels)."
+        )
+    elif TRAINING_CONFIG.pos_weight == 1.0:
+        pos_weight_value = 1.0
+        print("[evaluate_tft] Using unweighted BCE (pos_weight=1.0 from config).")
+    else:
+        pos_weight_value = float(TRAINING_CONFIG.pos_weight)
+        print(
+            f"[evaluate_tft] Using manual pos_weight from config: "
+            f"{pos_weight_value:.4f}"
+        )
+
     batch_size = TRAINING_CONFIG.batch_size
     val_loader = create_eval_dataloader(val_ds, batch_size=batch_size)
     test_loader = create_eval_dataloader(test_ds, batch_size=batch_size)
@@ -196,9 +239,14 @@ def main() -> None:
     model.load_state_dict(state_dict)
     model.eval()
 
-    # Use plain BCE for loss reporting; metrics are threshold-based anyway
-    criterion = torch.nn.BCEWithLogitsLoss()
-    print("[evaluate_tft] Using BCEWithLogitsLoss without pos_weight for eval loss.")
+    # Use the same loss style as in training (for reference)
+    if pos_weight_value == 1.0:
+        criterion = torch.nn.BCEWithLogitsLoss()
+        print("[evaluate_tft] Using BCEWithLogitsLoss with pos_weight=1.0 (no reweighting).")
+    else:
+        pos_weight_tensor = torch.tensor([pos_weight_value], device=device)
+        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+        print(f"[evaluate_tft] Using BCEWithLogitsLoss with pos_weight={pos_weight_value:.4f}")
 
     # Unique run ID for outputs
     run_id = time.strftime("tft_eval_%Y%m%d_%H%M%S")
@@ -276,7 +324,10 @@ def main() -> None:
     )
     test_metrics["loss"] = float(test_loss)
     test_metrics["threshold"] = float(best_threshold)
+    # Also log the validation F1 used to pick this threshold
     test_metrics["val_f1_at_threshold"] = float(best_f1)
+    # And the pos_weight we used
+    test_metrics["pos_weight"] = float(pos_weight_value)
 
     print("\n[evaluate_tft] Test metrics (using tuned threshold):")
     print(f"  Test loss:      {test_metrics['loss']:.4f}")

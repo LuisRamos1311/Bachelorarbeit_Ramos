@@ -17,9 +17,11 @@ import os
 from dataclasses import dataclass
 from typing import List
 
+
 # ============================
 # 1. DATA PATHS
 # ============================
+
 
 # Root directories (you can change these if needed)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -31,9 +33,11 @@ PLOTS_DIR = os.path.join(PROJECT_ROOT, "plots")
 # Main BTC daily CSV (CryptoDataDownload-style)
 BTC_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_daily.csv")
 
+
 # ============================
 # 2. DATE RANGES
 # ============================
+
 
 # You can adjust these for your final thesis experiments
 TRAIN_START_DATE = "2014-01-01"
@@ -45,9 +49,11 @@ VAL_END_DATE = "2020-12-31"
 TEST_START_DATE = "2021-01-01"
 TEST_END_DATE = "2024-12-31"
 
+
 # ============================
 # 3. FEATURES & LABELS
 # ============================
+
 
 # Sequence length (number of past days the model sees)
 SEQ_LENGTH = 30  # 30 days of history
@@ -137,6 +143,7 @@ PAST_COVARIATE_COLS: List[str] = FEATURE_COLS.copy()
 # Static covariates (e.g. asset ID, regime label) – not used yet for single BTC.
 STATIC_COLS: List[str] = []
 
+
 # ============================
 # 4. MODEL HYPERPARAMETERS
 # ============================
@@ -207,6 +214,7 @@ class ModelConfig:
 
 MODEL_CONFIG = ModelConfig()
 
+
 # ============================
 # 5. TRAINING HYPERPARAMETERS
 # ============================
@@ -223,8 +231,7 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
 
-    # Can be used to rebalance the loss if up/down labels are imbalanced.
-    # This is passed to BCEWithLogitsLoss(pos_weight=...).
+    # If pos_weight == 1 -> no reweighting (standard BCE).
     pos_weight: float = 1.0
 
     # Seed for reproducibility (torch, numpy, etc.)
@@ -232,14 +239,16 @@ class TrainingConfig:
 
     # Initial classification threshold on the sigmoid output.
     # You can tune this later on the validation set.
-    threshold: float = 0.05
+    threshold: float = 0.55
 
 
 TRAINING_CONFIG = TrainingConfig()
 
+
 # ============================
 # 6. EVALUATION / ARTIFACT DEFAULTS
 # ============================
+
 
 # Name of the file where the best model (by validation F1) is saved.
 BEST_MODEL_NAME: str = "tft_btc_best.pth"
@@ -256,7 +265,7 @@ EVAL_THRESHOLD: float = TRAINING_CONFIG.threshold
 # Threshold tuning configuration
 # ----------------------------
 
-# If True, evaluate_tft.py will:
+# If True, evaluate_tft_posweight_experiment.py will:
 #   1) Run the model on the *validation* set,
 #   2) Grid-search over a range of thresholds,
 #   3) Pick the threshold that maximizes THRESHOLD_TARGET_METRIC

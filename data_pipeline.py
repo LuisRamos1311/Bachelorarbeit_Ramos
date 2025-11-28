@@ -13,7 +13,7 @@ Main steps:
 7. Scale features (prices & volume with MinMax, indicators with StandardScaler).
 8. Build sliding window sequences for the TFT model (past inputs) and
    per-sample future covariate vectors.
-9. Provide a BTCTFTDataset class to be used in train_tft.py and evaluate_tft.py.
+9. Provide a BTCTFTDataset class to be used in train_tft.py and evaluate_tft_posweight_experiment.py.
 """
 
 import os
