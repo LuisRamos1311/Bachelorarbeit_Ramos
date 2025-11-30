@@ -1,18 +1,17 @@
 """
 train_tft.py
 
-Training script for the Temporal Fusion Transformer (TFT)
-on the BTC up/down dataset.
+Training script for the Temporal Fusion Transformer (TFT) on BTC data.
 
-Phase 3 (complete):
-- Set up device and seeds
-- Build train/val datasets & DataLoaders
-- Instantiate the TFT model, loss, optimizer
-- Run a full training loop with:
-    * per-epoch train & validation metrics
-    * best-model saving
-    * experiment history logging
-    * training curves saved to plots/
+Supports both:
+  - classification (up/down)  -> target_up
+  - regression (returns)      -> target_return
+
+The behaviour is controlled by config.TASK_TYPE:
+  - "classification": BCEWithLogitsLoss + classification metrics, model
+                      selection by Val F1.
+  - "regression":    MSELoss + regression metrics, model selection by
+                     Val RMSE, with additional directional metrics.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Tuple, Dict, Optional
+from typing import Dict, Tuple, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -31,11 +30,17 @@ from config import (
     MODELS_DIR,
     EXPERIMENTS_DIR,
     PLOTS_DIR,
+    TASK_TYPE,
+    UP_THRESHOLD,
 )
 from data_pipeline import prepare_datasets
 from tft_model import TemporalFusionTransformer
 import utils
 
+
+# ============================================================
+# 1. DATALOADER CREATION
+# ============================================================
 
 def create_dataloaders(
     train_dataset,
@@ -43,9 +48,7 @@ def create_dataloaders(
     batch_size: int,
 ) -> Tuple[DataLoader, DataLoader]:
     """
-    Wrap the PyTorch Datasets from data_pipeline.py into DataLoaders.
-
-    We shuffle the training set, but NOT the validation set.
+    Wrap PyTorch Datasets into DataLoaders.
     """
     train_loader = DataLoader(
         train_dataset,
@@ -64,64 +67,64 @@ def create_dataloaders(
     return train_loader, val_loader
 
 
+# ============================================================
+# 2. SINGLE-EPOCH TRAINING / EVAL
+# ============================================================
+
 def run_epoch(
     model: torch.nn.Module,
     data_loader: DataLoader,
-    criterion: torch.nn.Module,
     device: torch.device,
-    threshold: float,
-    train: bool = True,
+    criterion: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
-    max_grad_norm: float = 1.0,
+    train: bool = True,
+    threshold: float = 0.5,
 ) -> Dict[str, float]:
     """
-    Run a single epoch (train or validation).
+    Run one epoch over a DataLoader, for either training or validation.
 
     Args:
         model:
-            The TFT model.
+            The TemporalFusionTransformer model.
         data_loader:
-            DataLoader for train or validation set.
-        criterion:
-            BCEWithLogitsLoss (possibly with pos_weight).
+            DataLoader yielding (X_past, X_future, y) or (X_past, y).
         device:
-            torch.device("cuda") or torch.device("cpu").
-        threshold:
-            Classification threshold used for metrics.
-        train:
-            If True, run in training mode (with backprop).
-            If False, run in evaluation mode (no gradient updates).
+            Torch device.
+        criterion:
+            Loss function:
+              - BCEWithLogitsLoss for classification
+              - MSELoss (or similar) for regression
         optimizer:
-            Optimizer to use when train=True. Can be None when train=False.
-        max_grad_norm:
-            Max norm for gradient clipping (only used when train=True).
+            Optimizer (only required if train=True).
+        train:
+            If True, run in training mode and update weights.
+            If False, run in eval mode and do not update weights.
+        threshold:
+            Classification threshold on probabilities for computing
+            up/down labels (only used when TASK_TYPE="classification").
 
     Returns:
-        Dictionary with:
+        A dictionary of metrics. Always includes:
             - "loss"
-            - "accuracy"
-            - "precision"
-            - "recall"
-            - "f1"
-            - "auc"
+        Additionally:
+            - classification: accuracy, precision, recall, f1, auc
+            - regression: mse, mae, rmse, r2,
+                          direction_accuracy, direction_f1
     """
     if train:
         if optimizer is None:
-            raise ValueError("optimizer must be provided when train=True.")
+            raise ValueError("Optimizer must be provided when train=True.")
         model.train()
     else:
         model.eval()
 
     total_loss = 0.0
     all_true = []
-    all_prob = []
+    all_outputs = []
 
     num_samples = len(data_loader.dataset)
 
     for batch in data_loader:
-        # Batch can be:
-        #   - (x_past, y)
-        #   - (x_past, x_future, y)
         if len(batch) == 2:
             x_past, y = batch
             x_future = None
@@ -130,268 +133,288 @@ def run_epoch(
 
         x_past = x_past.to(device)
         y = y.to(device)
-
         if x_future is not None:
             x_future = x_future.to(device)
 
-        # Forward pass
         with torch.set_grad_enabled(train):
-            logits = model(x_past, x_future)         # (B, 1)
-            loss = criterion(logits.view(-1), y.view(-1))
+            # Model output: (batch_size, 1)
+            outputs = model(x_past, x_future).view(-1)
+            y_flat = y.view(-1)
+
+            loss = criterion(outputs, y_flat)
 
             if train:
-                # Backpropagation
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # Gradient clipping for stability
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                clip_value = TRAINING_CONFIG.grad_clip
+                if clip_value is not None and clip_value > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
 
-                # Optimizer step
                 optimizer.step()
 
         batch_size = y.size(0)
         total_loss += loss.item() * batch_size
 
-        # Collect probabilities and labels for metrics
-        probs = torch.sigmoid(logits).detach().cpu().view(-1)
-        all_prob.append(probs)
-        all_true.append(y.detach().cpu().view(-1))
+        all_true.append(y_flat.detach().cpu())
+        all_outputs.append(outputs.detach().cpu())
 
     if num_samples == 0:
-        raise ValueError("DataLoader has zero samples. Check your dataset/split sizes.")
+        raise RuntimeError("DataLoader has zero samples in run_epoch().")
 
-    all_true_tensor = torch.cat(all_true)
-    all_prob_tensor = torch.cat(all_prob)
+    y_true_all = torch.cat(all_true)      # shape: (N,)
+    y_out_all = torch.cat(all_outputs)    # shape: (N,)
 
     avg_loss = total_loss / num_samples
-    metrics = utils.compute_classification_metrics(
-        y_true=all_true_tensor,
-        y_prob=all_prob_tensor,
-        threshold=threshold,
-    )
-    metrics["loss"] = float(avg_loss)
+
+    # ---- Metrics depending on task type ----
+    if TASK_TYPE == "classification":
+        # Convert raw logits -> probabilities
+        y_prob = torch.sigmoid(y_out_all)
+        metrics = utils.compute_classification_metrics(
+            y_true=y_true_all,
+            y_prob=y_prob,
+            threshold=threshold,
+        )
+        metrics["loss"] = float(avg_loss)
+
+    elif TASK_TYPE == "regression":
+        # Use raw outputs as predicted returns
+        metrics = utils.compute_regression_metrics(
+            y_true=y_true_all,
+            y_pred=y_out_all,
+            direction_threshold=UP_THRESHOLD,
+        )
+        metrics["loss"] = float(avg_loss)
+    else:
+        raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
 
     return metrics
 
 
-def main() -> None:
-    # -------------------------
-    # 1. Reproducibility & device
-    # -------------------------
+# ============================================================
+# 3. MAIN TRAINING LOOP
+# ============================================================
 
+def main() -> None:
     utils.set_seed(TRAINING_CONFIG.seed)
     device = utils.get_device()
     print(f"[train_tft] Using device: {device}")
 
-    # Make sure output directories exist
     os.makedirs(MODELS_DIR, exist_ok=True)
     os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
     os.makedirs(PLOTS_DIR, exist_ok=True)
 
-
-    # -------------------------
-    # 2. Build datasets & loaders
-    # -------------------------
-
+    # 1) Prepare datasets
     print("[train_tft] Preparing datasets...")
-    train_ds, val_ds, test_ds, scalers = prepare_datasets()
+    train_dataset, val_dataset, test_dataset, scalers = prepare_datasets()
 
-    print(f"[train_tft] Train samples: {len(train_ds)}")
-    print(f"[train_tft] Val samples:   {len(val_ds)}")
-    print(f"[train_tft] Test samples:  {len(test_ds)}")
+    print(f"[train_tft] Train samples: {len(train_dataset)}")
+    print(f"[train_tft] Val samples:   {len(val_dataset)}")
+    print(f"[train_tft] Test samples:  {len(test_dataset)}")
 
-    # -------------------------
-    # 2a. Class balance & pos_weight
-    # -------------------------
-
-    # train_ds.labels is a 1D torch tensor of 0.0 / 1.0 on CPU (from BTCTFTDataset)
-    train_labels_np = train_ds.labels.numpy()
-    num_pos = float((train_labels_np == 1.0).sum())
-    num_neg = float((train_labels_np == 0.0).sum())
-    total = num_pos + num_neg
-
-    if total == 0:
-        raise ValueError("[train_tft] Training set has zero samples; check your splits.")
-
-    pos_frac = num_pos / total
-    print(
-        f"[train_tft] Class balance (train): "
-        f"negatives={int(num_neg)}, positives={int(num_pos)} "
-        f"(pos_frac={pos_frac:.4f})"
-    )
-
-    # Decide which pos_weight to use according to config semantics
-    if TRAINING_CONFIG.pos_weight < 0:
-        # Auto-compute from data
-        if num_pos == 0:
-            raise ValueError(
-                "[train_tft] No positive samples in training set; cannot compute pos_weight."
-            )
-        pos_weight_value = num_neg / num_pos
-        TRAINING_CONFIG.pos_weight = float(pos_weight_value)  # store for reference
-        print(
-            f"[train_tft] Auto-computed pos_weight={pos_weight_value:.4f} "
-            f"(= #neg / #pos on training labels)."
-        )
-    elif TRAINING_CONFIG.pos_weight == 1.0:
-        # Explicitly no re-weighting
-        pos_weight_value = 1.0
-        print("[train_tft] Using unweighted BCE (pos_weight=1.0 from config).")
-    else:
-        # User-specified fixed value
-        pos_weight_value = float(TRAINING_CONFIG.pos_weight)
-        print(
-            f"[train_tft] Using manual pos_weight from config: "
-            f"{pos_weight_value:.4f}"
-        )
-
-    # Now we can build DataLoaders as before
-    batch_size = TRAINING_CONFIG.batch_size
+    # 2) Dataloaders
     train_loader, val_loader = create_dataloaders(
-        train_dataset=train_ds,
-        val_dataset=val_ds,
-        batch_size=batch_size,
+        train_dataset,
+        val_dataset,
+        batch_size=TRAINING_CONFIG.batch_size,
     )
 
-
-    # -------------------------
-    # 3. Model, loss, optimizer
-    # -------------------------
-
+    # 3) Initialize model
     print("[train_tft] Initializing model...")
     model = TemporalFusionTransformer(MODEL_CONFIG).to(device)
 
-    # Binary classification with logits, using the pos_weight we decided above
-    if pos_weight_value == 1.0:
-        criterion = torch.nn.BCEWithLogitsLoss()
-        print("[train_tft] Using BCEWithLogitsLoss with pos_weight=1.0 (no reweighting).")
+    # 4) Loss function
+    if TASK_TYPE == "classification":
+        if TRAINING_CONFIG.pos_weight != 1.0:
+            pos_weight_tensor = torch.tensor(
+                [TRAINING_CONFIG.pos_weight], dtype=torch.float32, device=device
+            )
+            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+            print(
+                f"[train_tft] Using BCEWithLogitsLoss with "
+                f"pos_weight={TRAINING_CONFIG.pos_weight:.4f} for classification."
+            )
+        else:
+            criterion = torch.nn.BCEWithLogitsLoss()
+            print("[train_tft] Using BCEWithLogitsLoss without class weighting.")
+    elif TASK_TYPE == "regression":
+        criterion = torch.nn.MSELoss()
+        print("[train_tft] Using MSELoss for regression on continuous returns.")
     else:
-        pos_weight_tensor = torch.tensor([pos_weight_value], device=device)
-        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-        print(f"[train_tft] Using BCEWithLogitsLoss with pos_weight={pos_weight_value:.4f}")
+        raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
+    # 5) Optimizer
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=TRAINING_CONFIG.learning_rate,
         weight_decay=TRAINING_CONFIG.weight_decay,
     )
 
-    print(model)  # optional: prints architecture
+    print(model)
 
-
-    # -------------------------
-    # 4. Training loop
-    # -------------------------
-
+    # 6) Training setup
     num_epochs = TRAINING_CONFIG.num_epochs
-    threshold = TRAINING_CONFIG.threshold
+    threshold = TRAINING_CONFIG.threshold  # classification prob threshold
 
-    # History dictionary for logging & plotting
     history = {
         "epoch": [],
         "train_loss": [],
         "val_loss": [],
-        "train_accuracy": [],
-        "val_accuracy": [],
-        "train_precision": [],
-        "val_precision": [],
-        "train_recall": [],
-        "val_recall": [],
-        "train_f1": [],
-        "val_f1": [],
-        "train_auc": [],
-        "val_auc": [],
     }
 
-    best_val_f1 = -1.0
+    # History fields + model selection metric depending on task
+    if TASK_TYPE == "classification":
+        history.update(
+            {
+                "train_accuracy": [],
+                "val_accuracy": [],
+                "train_precision": [],
+                "val_precision": [],
+                "train_recall": [],
+                "val_recall": [],
+                "train_f1": [],
+                "val_f1": [],
+                "train_auc": [],
+                "val_auc": [],
+            }
+        )
+        selection_metric_name = "f1"
+        best_val_metric = -1.0
+        selection_mode = "max"
+        print("[train_tft] Model selection metric: Val F1 (maximize).")
+    elif TASK_TYPE == "regression":
+        history.update(
+            {
+                "train_mse": [],
+                "val_mse": [],
+                "train_mae": [],
+                "val_mae": [],
+                "train_rmse": [],
+                "val_rmse": [],
+                "train_r2": [],
+                "val_r2": [],
+                "train_direction_accuracy": [],
+                "val_direction_accuracy": [],
+                "train_direction_f1": [],
+                "val_direction_f1": [],
+            }
+        )
+        selection_metric_name = "rmse"
+        best_val_metric = float("inf")
+        selection_mode = "min"
+        print("[train_tft] Model selection metric: Val RMSE (minimize).")
+    else:
+        raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
+
     best_model_path = os.path.join(MODELS_DIR, "tft_btc_best.pth")
 
-    print(f"[train_tft] Starting training for {num_epochs} epochs...")
+    print(f"[train_tft] Starting training for {num_epochs} epochs.")
 
     for epoch in range(1, num_epochs + 1):
-        print(f"\n[train_tft] Epoch {epoch}/{num_epochs}")
+        print(f"[train_tft] Epoch {epoch}/{num_epochs}")
 
-        # ---- Train epoch ----
+        # --- Train epoch ---
         train_metrics = run_epoch(
             model=model,
             data_loader=train_loader,
-            criterion=criterion,
             device=device,
-            threshold=threshold,
-            train=True,
+            criterion=criterion,
             optimizer=optimizer,
-            max_grad_norm=1.0,
+            train=True,
+            threshold=threshold,
         )
 
-        # ---- Validation epoch ----
+        # --- Validation epoch ---
         val_metrics = run_epoch(
             model=model,
             data_loader=val_loader,
-            criterion=criterion,
             device=device,
-            threshold=threshold,
+            criterion=criterion,
+            optimizer=None,
             train=False,
-            optimizer=None,  # not used when train=False
-            max_grad_norm=1.0,
+            threshold=threshold,
         )
 
-        # ---- Log metrics ----
+        # Record in history
         history["epoch"].append(epoch)
-
         history["train_loss"].append(train_metrics["loss"])
         history["val_loss"].append(val_metrics["loss"])
 
-        history["train_accuracy"].append(train_metrics["accuracy"])
-        history["val_accuracy"].append(val_metrics["accuracy"])
+        if TASK_TYPE == "classification":
+            history["train_accuracy"].append(train_metrics["accuracy"])
+            history["val_accuracy"].append(val_metrics["accuracy"])
+            history["train_precision"].append(train_metrics["precision"])
+            history["val_precision"].append(val_metrics["precision"])
+            history["train_recall"].append(train_metrics["recall"])
+            history["val_recall"].append(val_metrics["recall"])
+            history["train_f1"].append(train_metrics["f1"])
+            history["val_f1"].append(val_metrics["f1"])
+            history["train_auc"].append(train_metrics["auc"])
+            history["val_auc"].append(val_metrics["auc"])
 
-        history["train_precision"].append(train_metrics["precision"])
-        history["val_precision"].append(val_metrics["precision"])
+            print(
+                f"[train_tft][Epoch {epoch}] "
+                f"Train loss={train_metrics['loss']:.4f}, "
+                f"Val loss={val_metrics['loss']:.4f}, "
+                f"Train F1={train_metrics['f1']:.4f}, "
+                f"Val F1={val_metrics['f1']:.4f}, "
+                f"Val Acc={val_metrics['accuracy']:.4f}"
+            )
 
-        history["train_recall"].append(train_metrics["recall"])
-        history["val_recall"].append(val_metrics["recall"])
+        elif TASK_TYPE == "regression":
+            history["train_mse"].append(train_metrics["mse"])
+            history["val_mse"].append(val_metrics["mse"])
+            history["train_mae"].append(train_metrics["mae"])
+            history["val_mae"].append(val_metrics["mae"])
+            history["train_rmse"].append(train_metrics["rmse"])
+            history["val_rmse"].append(val_metrics["rmse"])
+            history["train_r2"].append(train_metrics["r2"])
+            history["val_r2"].append(val_metrics["r2"])
+            history["train_direction_accuracy"].append(train_metrics["direction_accuracy"])
+            history["val_direction_accuracy"].append(val_metrics["direction_accuracy"])
+            history["train_direction_f1"].append(train_metrics["direction_f1"])
+            history["val_direction_f1"].append(val_metrics["direction_f1"])
 
-        history["train_f1"].append(train_metrics["f1"])
-        history["val_f1"].append(val_metrics["f1"])
+            print(
+                f"[train_tft][Epoch {epoch}] "
+                f"Train loss={train_metrics['loss']:.6f}, "
+                f"Val loss={val_metrics['loss']:.6f}, "
+                f"Train RMSE={train_metrics['rmse']:.6f}, "
+                f"Val RMSE={val_metrics['rmse']:.6f}, "
+                f"Val DirAcc={val_metrics['direction_accuracy']:.4f}, "
+                f"Val DirF1={val_metrics['direction_f1']:.4f}"
+            )
 
-        history["train_auc"].append(train_metrics["auc"])
-        history["val_auc"].append(val_metrics["auc"])
+        # --- Model selection ---
+        current_val_metric = val_metrics[selection_metric_name]
+        if selection_mode == "max":
+            is_better = current_val_metric > best_val_metric
+        else:
+            is_better = current_val_metric < best_val_metric
 
-        print(
-            f"[train_tft][Epoch {epoch}] "
-            f"Train loss={train_metrics['loss']:.4f}, "
-            f"Val loss={val_metrics['loss']:.4f}, "
-            f"Train F1={train_metrics['f1']:.4f}, "
-            f"Val F1={val_metrics['f1']:.4f}, "
-            f"Val Acc={val_metrics['accuracy']:.4f}"
-        )
-
-        # ---- Save best model (by validation F1) ----
-        if val_metrics["f1"] > best_val_f1:
-            best_val_f1 = val_metrics["f1"]
+        if is_better:
+            best_val_metric = current_val_metric
             torch.save(model.state_dict(), best_model_path)
             print(
-                f"[train_tft] New best model saved with Val F1={best_val_f1:.4f} "
+                f"[train_tft] New best model saved with "
+                f"Val {selection_metric_name.upper()}={best_val_metric:.4f} "
                 f"to {best_model_path}"
             )
 
-    print("\n[train_tft] Training finished.")
-    print(f"[train_tft] Best Val F1: {best_val_f1:.4f}")
+    print(
+        f"[train_tft] Training finished. "
+        f"Best Val {selection_metric_name.upper()}: {best_val_metric:.4f}"
+    )
 
-
-    # -------------------------
-    # 5. Save experiment history & training curves
-    # -------------------------
-
+    # Save training history
     run_id = time.strftime("tft_run_%Y%m%d_%H%M%S")
-
-    # Save history as JSON
     history_path = os.path.join(EXPERIMENTS_DIR, f"{run_id}_history.json")
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"[train_tft] History saved to {history_path}")
 
-    # Save training curves plot
+    # Plot curves
     curves_path = os.path.join(PLOTS_DIR, f"{run_id}_training_curves.png")
     utils.plot_training_curves(history, curves_path)
     print(f"[train_tft] Training curves saved to {curves_path}")
@@ -399,4 +422,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

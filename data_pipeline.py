@@ -4,16 +4,16 @@ data_pipeline.py
 Turns raw daily BTC price data into PyTorch Datasets for the TFT model.
 
 Main steps:
-1. Load daily BTC OHLCV data from CSV.
+1. Load daily BTC price data from CSV.
 2. Add technical indicators (ROC, ATR, MACD, RSI).
 3. Add calendar and halving-related features (per day).
 4. Create "next-day" future covariate columns via shift(-1).
-5. Create binary up/down label for next day.
+5. Create continuous return target + binary up/down label.
 6. Split into train / validation / test sets by date.
 7. Scale features (prices & volume with MinMax, indicators with StandardScaler).
 8. Build sliding window sequences for the TFT model (past inputs) and
    per-sample future covariate vectors.
-9. Provide a BTCTFTDataset class to be used in train_tft.py and evaluate_tft_posweight_experiment.py.
+9. Provide a BTCTFTDataset class to be used in train_tft.py and evaluate_tft.py.
 """
 
 import os
@@ -83,7 +83,7 @@ def load_btc_daily(csv_path: str | None = None) -> pd.DataFrame:
     if rename_map:
         df = df.rename(columns=rename_map)
 
-    # We don't  need 'unix' or 'symbol' for modelling
+    # We don't need 'unix' or 'symbol' for modelling
     for col in ["unix", "symbol"]:
         if col in df.columns:
             df = df.drop(columns=[col])
@@ -262,9 +262,9 @@ def add_future_covariates(df: pd.DataFrame) -> pd.DataFrame:
     Create next-day (t+1) future covariate columns by shifting base features.
 
     We use:
-        - day_of_week      -> dow_next
-        - is_weekend       -> is_weekend_next
-        - month            -> month_next
+        - day_of_week       -> dow_next
+        - is_weekend        -> is_weekend_next
+        - month             -> month_next
         - is_halving_window -> is_halving_window_next
 
     After this transformation, at index t we have information about day t+1
@@ -299,19 +299,16 @@ def add_future_covariates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================
-# 4. TARGET (UP / DOWN LABEL)
+# 4. TARGETS (RETURN + UP/DOWN)
 # ============================
 
 def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOLD) -> pd.DataFrame:
     """
-    Add a binary target column 'target_up' to the DataFrame.
+    Add continuous and binary targets to the DataFrame:
 
-    Steps:
-    1. Compute the future 1-day return:
-         future_return_t = (close_{t+1} - close_t) / close_t
-       aligned with day t.
-    2. Label:
-         target_up = 1 if future_return_t > up_threshold else 0
+        - future_return_1d : (close_{t+1} - close_t) / close_t
+        - target_return    : alias for future_return_1d (regression target)
+        - target_up        : 1 if future_return_1d > up_threshold else 0
 
     We drop the last row because it has no "next day" to compare to.
     This also removes the NaNs created in add_future_covariates().
@@ -322,6 +319,10 @@ def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOL
     # Shift -1 so that at index t we have (close_{t+1} - close_t) / close_t
     df["future_return_1d"] = df["close"].pct_change().shift(-1)
 
+    # Continuous regression target: for now we just reuse the simple pct return.
+    # (If you prefer log-returns later, you can change this line only.)
+    df["target_return"] = df["future_return_1d"]
+
     # Binary label: 1 if future return > threshold, else 0
     df["target_up"] = (df["future_return_1d"] > up_threshold).astype(int)
 
@@ -329,6 +330,59 @@ def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOL
     df = df.dropna(subset=["future_return_1d"])
 
     return df
+
+
+def print_label_distribution(
+    df: pd.DataFrame,
+    name: str = "FULL",
+    freq: str = "Y",
+) -> None:
+    """
+    Print UP/DOWN counts (and UP %) aggregated over time.
+
+    Args:
+        df:   DataFrame with DatetimeIndex and a direction label column (config.DIRECTION_LABEL_COLUMN).
+        name: Name of the split, e.g. 'FULL', 'TRAIN', 'VAL', 'TEST'.
+        freq: Pandas offset alias for grouping, e.g. 'Y' (year), 'Q' (quarter), 'M' (month).
+    """
+    direction_col = config.DIRECTION_LABEL_COLUMN
+
+    if direction_col not in df.columns:
+        raise ValueError(
+            f"print_label_distribution expects a '{direction_col}' column in df."
+        )
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("print_label_distribution expects a DatetimeIndex on df.")
+
+    if len(df) == 0:
+        print(f"[data_pipeline] [{name}] No rows -> cannot compute label distribution.")
+        return
+
+    labels = df[direction_col].astype(int)
+    total_ups = int(labels.sum())
+    total_count = int(len(labels))
+    total_downs = total_count - total_ups
+    total_up_ratio = total_ups / total_count
+
+    # Group by requested frequency (default: yearly)
+    grouped = df.groupby(df.index.to_period(freq))[direction_col].agg(["sum", "count"])
+
+    print(f"[data_pipeline] Label distribution for {name} (grouped by {freq}):")
+    for period, row in grouped.iterrows():
+        ups = int(row["sum"])
+        count = int(row["count"])
+        downs = count - ups
+        up_ratio = ups / count if count > 0 else 0.0
+        print(
+            f"  [{name}] {period} -> "
+            f"UP: {ups:4d}, DOWN: {downs:4d}, UP%: {up_ratio*100:5.1f}  (N={count})"
+        )
+
+    print(
+        f"  [{name}] TOTAL -> UP: {total_ups}, DOWN: {total_downs}, "
+        f"UP%: {total_up_ratio*100:.1f}  (N={total_count})"
+    )
+    print()
 
 
 # ============================
@@ -379,11 +433,11 @@ def scale_features(
 
     scalers_dict contains:
         {
-            "price_volume_scaler": ...,
-            "indicator_scaler": ...,
-            "feature_cols": [...],
-            "price_volume_cols": [...],
-            "indicator_cols": [...],
+            "price_volume_scaler": .,
+            "indicator_scaler": .,
+            "feature_cols": [.],
+            "price_volume_cols": [.],
+            "indicator_cols": [.],
         }
     """
 
@@ -432,34 +486,38 @@ def build_sequences(
     feature_cols: List[str],
     seq_length: int = config.SEQ_LENGTH,
     future_cols: List[str] | None = None,
+    label_col: str = config.TARGET_COLUMN,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
     Build sliding-window sequences and labels from a DataFrame.
 
     For each sample:
         - X_past: sequence of length `seq_length` over feature_cols
-        - y:      'target_up' value of the LAST day in the sequence
+        - y:      value of `label_col` at the LAST day in the sequence
         - f:      (optional) vector of future covariates for t+1
 
     We assume:
-        - target_up at day t encodes up/down from t -> t+1
+        - label_col at day t encodes what happens from t -> t+1
+          (e.g. target_return or target_up)
         - *_next columns at day t already contain information about t+1
           (created via add_future_covariates() using shift(-1)).
 
     Example:
         If seq_length = 30, we use days [t-29, ..., t] as input,
         and:
-            y = target_up at day t
+            y = df[label_col] at day t
             f = future covariates stored at day t (describing t+1).
     """
-    if "target_up" not in df.columns:
-        raise ValueError("DataFrame must contain 'target_up' column before building sequences.")
+    if label_col not in df.columns:
+        raise ValueError(
+            f"DataFrame must contain '{label_col}' column before building sequences."
+        )
 
     df = df.copy()
     df = df.sort_index()  # ensure chronological order
 
     feature_array = df[feature_cols].values.astype(np.float32)
-    target_array = df["target_up"].values.astype(np.float32)
+    target_array = df[label_col].values.astype(np.float32)
 
     if future_cols is not None:
         for col in future_cols:
@@ -480,23 +538,25 @@ def build_sequences(
     for end_idx in range(seq_length - 1, len(df)):
         start_idx = end_idx - seq_length + 1
 
-        # Past sequence for days [start_idx, ..., end_idx]
-        seq_x = feature_array[start_idx : end_idx + 1]   # shape: (seq_length, n_features)
-        y = target_array[end_idx]                        # scalar label at day t=end_idx
+        # Past sequence for days [start_idx, ... end_idx]
+        seq_x = feature_array[start_idx: end_idx + 1]   # shape: (seq_length, n_features)
+        y = target_array[end_idx]                       # scalar label at day t=end_idx
 
         sequences.append(seq_x)
         labels.append(y)
 
         # Future covariates for day t+1 (stored at row t=end_idx)
         if future_array is not None:
-            f = future_array[end_idx]                    # shape: (n_future_features,)
+            f = future_array[end_idx]                   # shape: (n_future_features,)
             future_covariates.append(f)
 
     sequences = np.stack(sequences)          # shape: (num_samples, seq_length, n_features)
     labels = np.array(labels)                # shape: (num_samples,)
 
     if future_array is not None:
-        future_covariates_arr: np.ndarray | None = np.stack(future_covariates)  # (num_samples, n_future_features)
+        future_covariates_arr: np.ndarray | None = np.stack(
+            future_covariates
+        )  # (num_samples, n_future_features)
     else:
         future_covariates_arr = None
 
@@ -567,11 +627,13 @@ def prepare_datasets(
     2. Add technical indicators.
     3. Add calendar and halving-related base features.
     4. Add next-day future covariate columns via shift(-1).
-    5. Add target_up column.
-    6. Split by date into train / val / test.
-    7. Scale features.
-    8. Build sequences (past) and per-sample future covariate vectors.
-    9. Wrap them into BTCTFTDataset objects.
+    5. Add continuous return target + binary direction label.
+    6. Print label distribution (per year + overall).
+    7. Split by date into train / val / test.
+    8. Print label distribution for each split.
+    9. Scale features.
+    10. Build sequences (past) and per-sample future covariate vectors.
+    11. Wrap them into BTCTFTDataset objects.
 
     Returns:
         train_dataset, val_dataset, test_dataset, scalers_dict
@@ -589,8 +651,11 @@ def prepare_datasets(
     # 4. Add next-day future covariate columns (will be used later for TFT)
     df = add_future_covariates(df)
 
-    # 5. Add up/down label (this also drops the last row with NaNs)
+    # 5. Add continuous + binary targets (this also drops the last row with NaNs)
     df = add_target_column(df, up_threshold=config.UP_THRESHOLD)
+
+    # 6. Print global label distribution (yearly) using direction label
+    print_label_distribution(df, name="FULL", freq="Y")
 
     # Which columns we will feed into the model as past covariates (from config)
     feature_cols = config.FEATURE_COLS
@@ -603,26 +668,34 @@ def prepare_datasets(
     # Future covariate columns (calendar + halving for t+1)
     future_cols = config.FUTURE_COVARIATE_COLS
 
-    # 6. Train/Val/Test split
+    # 7. Train/Val/Test split
     train_df, val_df, test_df = split_by_date(df)
 
-    # 7. Scale features (for past covariates)
+    # 8. Print label distribution for each split (yearly)
+    print_label_distribution(train_df, name="TRAIN", freq="Y")
+    print_label_distribution(val_df,   name="VAL",   freq="Y")
+    print_label_distribution(test_df,  name="TEST",  freq="Y")
+
+    # 9. Scale features (for past covariates)
     train_df_scaled, val_df_scaled, test_df_scaled, scalers = scale_features(
         train_df, val_df, test_df, feature_cols
     )
 
-    # 8. Build sequences + future covariate vectors
+    # Label column to use when building sequences (regression or classification)
+    label_col = config.TARGET_COLUMN
+
+    # 10. Build sequences + future covariate vectors
     train_seq, train_labels, train_future = build_sequences(
-        train_df_scaled, feature_cols, seq_length, future_cols=future_cols
+        train_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
     )
     val_seq, val_labels, val_future = build_sequences(
-        val_df_scaled, feature_cols, seq_length, future_cols=future_cols
+        val_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
     )
     test_seq, test_labels, test_future = build_sequences(
-        test_df_scaled, feature_cols, seq_length, future_cols=future_cols
+        test_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
     )
 
-    # 9. Wrap into Datasets
+    # 11. Wrap into Datasets
     train_dataset = BTCTFTDataset(train_seq, train_labels, train_future)
     val_dataset   = BTCTFTDataset(val_seq, val_labels, val_future)
     test_dataset  = BTCTFTDataset(test_seq, test_labels, test_future)
@@ -641,15 +714,16 @@ if __name__ == "__main__":
     This self-test will:
       - Build train/val/test datasets
       - Print how many samples each split has
+      - Print label distributions per year (full + splits)
       - Inspect the first training sample:
           * its shape
-          * its label (0.0 or 1.0)
+          * its label (regression target or binary label, depending on config.TARGET_COLUMN)
           * future covariate vector (if present)
           * first 3 timesteps of the sequence
           * last 3 timesteps of the sequence
           * last timestep with feature names
     """
-    print("[data_pipeline] Running self-test...")
+    print("[data_pipeline] Running self-test.")
 
     # Run the full pipeline
     train_ds, val_ds, test_ds, scalers = prepare_datasets()
@@ -672,7 +746,7 @@ if __name__ == "__main__":
     print(f"One sample X shape:       {x.shape}  (seq_length, n_features)")
     if future is not None:
         print(f"One sample future shape:  {future.shape}  (n_future_features,)")
-    print(f"One sample y:             {y.item()} (0.0 or 1.0)")
+    print(f"One sample y:             {y.item()}")
 
     # Convert to numpy for nicer printing (still scaled values!)
     x_np = x.numpy()

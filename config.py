@@ -1,12 +1,13 @@
 """
 config.py
 
-Central configuration for the TFT BTC up/down project.
+Central configuration for the TFT BTC up/down / return project.
 
 This file groups together:
 - Data paths and date ranges
 - Feature definitions (past & known-future covariates)
 - Labeling rules (e.g. what counts as "up")
+- Task configuration (classification vs regression)
 - Model and training hyperparameters
 
 Other modules (data_pipeline.py, train_tft.py, tft_model.py, etc.)
@@ -51,15 +52,28 @@ TEST_END_DATE = "2024-12-31"
 
 
 # ============================
-# 3. FEATURES & LABELS
+# 3. FEATURES, LABELS & TASK
 # ============================
 
+# -------- Task-level configuration --------
+#
+# TASK_TYPE controls how the rest of the pipeline interprets the target:
+#   - "classification": binary up/down, using target_up
+#   - "regression":    continuous return, using target_return (or similar)
+#
+# TARGET_COLUMN is the main label column used when building sequences.
+# DIRECTION_LABEL_COLUMN is the binary up/down label derived from returns
+# and used for counts, confusion matrices, etc.
+TASK_TYPE: str = "regression"          # "regression" or "classification"
+TARGET_COLUMN: str = "target_return"   # will be created in data_pipeline.py
+DIRECTION_LABEL_COLUMN: str = "target_up"
 
 # Sequence length (number of past days the model sees)
 SEQ_LENGTH = 30  # 30 days of history
 
 # Threshold for calling a move "up".
 # If future_return > UP_THRESHOLD -> label = 1 (UP), else 0 (DOWN/FLAT)
+# This is used when constructing target_up from future_return_1d.
 UP_THRESHOLD = 0.0
 
 # -------- Core price & indicator features (past covariates) --------
@@ -161,7 +175,9 @@ class ModelConfig:
     - multi-head self-attention over the encoded sequence
     - temporal feed-forward / gating blocks (GRNs with GLU)
     - optional known future covariate encoder (calendar + halving for t+1)
-    - final linear layer that outputs one logit for binary up/down
+    - final linear layer that outputs one value per sample:
+        * classification: logit (before sigmoid)
+        * regression:     predicted return
     """
 
     # Number of input features per time step (must match FEATURE_COLS length)
@@ -191,8 +207,6 @@ class ModelConfig:
     use_variable_selection: bool = True
 
     # Use known future covariates (e.g. calendar & halving info for t+1).
-    # We will actually wire this into tft_model.py next; you can turn it off
-    # later for ablation experiments.
     use_future_covariates: bool = True
 
     # Hidden size used inside variable selection networks (VSNs) and GRNs.
@@ -208,7 +222,7 @@ class ModelConfig:
     # Placeholder for future extension with static covariates
     use_static_covariates: bool = False
 
-    # 1 logit for binary classification (up vs down)
+    # Single output dimension: either logit (classification) or return (regression)
     output_size: int = 1
 
 
@@ -232,15 +246,20 @@ class TrainingConfig:
     weight_decay: float = 1e-5
 
     # If pos_weight == 1 -> no reweighting (standard BCE).
+    # Only used when TASK_TYPE == "classification".
     pos_weight: float = 1.0
 
     # Seed for reproducibility (torch, numpy, etc.)
     seed: int = 42
 
     # Initial classification threshold on the sigmoid output.
-    # You can tune this later on the validation set.
+    # Only relevant when TASK_TYPE == "classification".
     threshold: float = 0.55
 
+    # gradient clipping (L2 norm)
+    # If > 0: clip gradients to this max norm.
+    # If <= 0: no clipping applied.
+    grad_clip: float = 1.0
 
 TRAINING_CONFIG = TrainingConfig()
 
@@ -250,22 +269,22 @@ TRAINING_CONFIG = TrainingConfig()
 # ============================
 
 
-# Name of the file where the best model (by validation F1) is saved.
+# Name of the file where the best model checkpoint is saved.
 BEST_MODEL_NAME: str = "tft_btc_best.pth"
 
 # Full path to the best-model checkpoint (used by both training & evaluation).
 BEST_MODEL_PATH: str = os.path.join(MODELS_DIR, BEST_MODEL_NAME)
 
 # Default threshold to use during final evaluation on the test set.
-# For now we keep it equal to the training threshold, but you can
-# override this later if you tune a better threshold on the validation set.
+# Only meaningful for classification tasks.
 EVAL_THRESHOLD: float = TRAINING_CONFIG.threshold
 
 # ----------------------------
 # Threshold tuning configuration
 # ----------------------------
+# These settings are only relevant when TASK_TYPE == "classification".
 
-# If True, evaluate_tft_posweight_experiment.py will:
+# If True, evaluate_tft will:
 #   1) Run the model on the *validation* set,
 #   2) Grid-search over a range of thresholds,
 #   3) Pick the threshold that maximizes THRESHOLD_TARGET_METRIC
