@@ -4,14 +4,17 @@ train_tft.py
 Training script for the Temporal Fusion Transformer (TFT) on BTC data.
 
 Supports both:
-  - classification (up/down)  -> target_up
-  - regression (returns)      -> target_return
+  - classification (up/down)        -> target_up (binary label)
+  - regression (multi-horizon returns)
+        -> continuous forward returns for each horizon in
+           config.FORECAST_HORIZONS (e.g. 1, 3, 7 days)
 
 The behaviour is controlled by config.TASK_TYPE:
-  - "classification": BCEWithLogitsLoss + classification metrics, model
-                      selection by Val F1.
-  - "regression":    MSELoss + regression metrics, model selection by
-                     Val RMSE, with additional directional metrics.
+  - "classification": BCEWithLogitsLoss + classification metrics,
+                      model selection by Val F1.
+  - "regression":    MSELoss on multi-horizon returns, aggregated
+                     regression metrics (MSE, RMSE, MAE, R^2) and
+                     directional metrics, model selection by Val RMSE.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from typing import Dict, Tuple, Optional
 import torch
 from torch.utils.data import DataLoader
 
-from config import (
+from experiment_1.config import (
     MODEL_CONFIG,
     TRAINING_CONFIG,
     MODELS_DIR,
@@ -33,9 +36,9 @@ from config import (
     TASK_TYPE,
     UP_THRESHOLD,
 )
-from data_pipeline import prepare_datasets
-from tft_model import TemporalFusionTransformer
-import utils
+from experiment_1.data_pipeline import prepare_datasets
+from experiment_1.tft_model import TemporalFusionTransformer
+from experiment_1 import utils
 
 
 # ============================================================
@@ -85,7 +88,7 @@ def run_epoch(
 
     Args:
         model:
-            The TemporalFusionTransformer model.
+            The Temporal Fusion Transformer model.
         data_loader:
             DataLoader yielding (X_past, X_future, y) or (X_past, y).
         device:
@@ -119,12 +122,13 @@ def run_epoch(
         model.eval()
 
     total_loss = 0.0
-    all_true = []
-    all_outputs = []
+    all_true: list[torch.Tensor] = []
+    all_outputs: list[torch.Tensor] = []
 
     num_samples = len(data_loader.dataset)
 
     for batch in data_loader:
+        # Unpack batch: supports both (x_past, y) and (x_past, x_future, y)
         if len(batch) == 2:
             x_past, y = batch
             x_future = None
@@ -137,12 +141,34 @@ def run_epoch(
             x_future = x_future.to(device)
 
         with torch.set_grad_enabled(train):
-            # Model output: (batch_size, 1)
-            outputs = model(x_past, x_future).view(-1)
-            y_flat = y.view(-1)
+            # Forward pass
+            outputs = model(x_past) if x_future is None else model(x_past, x_future)
 
-            loss = criterion(outputs, y_flat)
+            if TASK_TYPE == "classification":
+                # Single-horizon classification: flatten to (B,)
+                outputs = outputs.view(-1)
+                y_flat = y.view(-1)
+                loss = criterion(outputs, y_flat)
 
+                y_for_metrics = y_flat
+                out_for_metrics = outputs
+
+            elif TASK_TYPE == "regression":
+                # Multi-horizon regression:
+                #   outputs: (B, H)
+                #   y:       (B, H)
+                # MSELoss will average over all horizons.
+                loss = criterion(outputs, y)
+
+                # For metrics we keep the full (B, H) tensors;
+                # compute_regression_metrics will flatten later.
+                y_for_metrics = y
+                out_for_metrics = outputs
+
+            else:
+                raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
+
+            # Backward + optimize
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -153,17 +179,21 @@ def run_epoch(
 
                 optimizer.step()
 
-        batch_size = y.size(0)
+        # Accumulate loss and predictions
+        batch_size = y.size(0)  # number of samples in batch (not horizons)
         total_loss += loss.item() * batch_size
 
-        all_true.append(y_flat.detach().cpu())
-        all_outputs.append(outputs.detach().cpu())
+        all_true.append(y_for_metrics.detach().cpu())
+        all_outputs.append(out_for_metrics.detach().cpu())
 
     if num_samples == 0:
         raise RuntimeError("DataLoader has zero samples in run_epoch().")
 
-    y_true_all = torch.cat(all_true)      # shape: (N,)
-    y_out_all = torch.cat(all_outputs)    # shape: (N,)
+    # Concatenate along batch dimension:
+    #   classification: (N,)
+    #   regression (multi-horizon): (N, H)
+    y_true_all = torch.cat(all_true, dim=0)
+    y_out_all = torch.cat(all_outputs, dim=0)
 
     avg_loss = total_loss / num_samples
 
@@ -179,7 +209,9 @@ def run_epoch(
         metrics["loss"] = float(avg_loss)
 
     elif TASK_TYPE == "regression":
-        # Use raw outputs as predicted returns
+        # Use raw outputs as predicted returns.
+        # compute_regression_metrics will internally flatten (N, H) -> (N*H,)
+        # for aggregate MSE/RMSE/MAE/R^2 + directional metrics.
         metrics = utils.compute_regression_metrics(
             y_true=y_true_all,
             y_pred=y_out_all,

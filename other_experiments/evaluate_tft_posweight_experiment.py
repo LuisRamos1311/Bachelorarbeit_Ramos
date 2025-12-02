@@ -25,21 +25,20 @@ import os
 import time
 from typing import Tuple
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
-from config import (
+from experiment_1.config import (
     MODEL_CONFIG,
     TRAINING_CONFIG,
     MODELS_DIR,
     EXPERIMENTS_DIR,
     PLOTS_DIR,
 )
-from data_pipeline import prepare_datasets
-from tft_model import TemporalFusionTransformer
-import utils
+from experiment_1.data_pipeline import prepare_datasets
+from experiment_1.tft_model import TemporalFusionTransformer
+from experiment_1 import utils
 
 
 def create_eval_dataloader(dataset, batch_size: int) -> DataLoader:

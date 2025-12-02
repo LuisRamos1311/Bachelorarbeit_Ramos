@@ -1,22 +1,23 @@
 """
 tft_model.py
 
-Defines a simplified Temporal Fusion Transformer-style model for predicting
-next-day BTC up/down movements.
+Defines a simplified Temporal Fusion Transformer-style model for
+multi-horizon BTC return forecasting.
 
 Current architecture (with optional VSNs, gating and known future inputs):
 
-1. Variable Selection Network (optional) or linear projection from raw input
-   features to a shared hidden size.
+1. Variable Selection Network (optional) or linear projection from raw
+   input features to a shared hidden size.
 2. LSTM encoder over the past time steps.
 3. Multi-head self-attention over the encoded sequence.
-4. Temporal feed-forward / gating block (Gated Residual Networks).
+4. Temporal feed-forward / gating block (Gated Residual Networks or
+   residual MLP).
 5. Optional future covariate encoder (calendar + halving info for t+1).
-6. Aggregation over time (we use the last time step), fusion with future
-   context, and a final linear layer to output a single logit for
-   binary classification.
+6. Aggregation over time (we use the last time step), optional fusion
+   with future context, and a final linear layer to output a vector of
+   horizon-wise predicted returns.
 
-Other modules (train_tft.py, evaluate_tft_posweight_experiment.py, etc.) should treat this as a
+Other modules (train_tft.py, evaluate_tft.py, etc.) should treat this as a
 standard PyTorch model:
 
     from tft_model import TemporalFusionTransformer
@@ -27,7 +28,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-import config
+from experiment_1 import config
 
 
 # ============================
@@ -247,7 +248,7 @@ class VariableSelectionNetwork(nn.Module):
 
 class TemporalFusionTransformer(nn.Module):
     """
-    Simplified Temporal Fusion Transformer-style model.
+    Simplified Temporal Fusion Transformer-style model for BTC.
 
     Expected input:
         x_past:
@@ -260,9 +261,16 @@ class TemporalFusionTransformer(nn.Module):
             is True, x_future must be provided.
 
     Output:
-        logits:
+        outputs:
             Tensor of shape (batch_size, output_size)
-            For this project, output_size = 1 (binary up/down logit).
+
+            - For regression (main thesis setting):
+                output_size = len(config.MODEL_CONFIG.forecast_horizons),
+                each entry is a predicted return for a given horizon
+                (e.g. [r_1d, r_3d, r_7d]).
+
+            - For classification (if you ever reconfigure):
+                entries can be interpreted as logits.
 
     If return_attention=True, the forward pass also returns the attention
     weights from the multi-head attention layer, which can be used later
@@ -417,8 +425,10 @@ class TemporalFusionTransformer(nn.Module):
 
         # -------- 6. Output layer --------
         # We will aggregate over time (take last time step), optionally fuse
-        # with future covariates, and map the hidden_size vector to a single
-        # logit for up/down.
+        # with future covariates, and map the hidden_size vector to
+        # output_size values:
+        #   - regression: one return per forecast horizon
+        #   - classification: per-horizon logits (if you ever use that mode)
         self.output_layer = nn.Linear(hidden_size, self.config.output_size)
 
     def forward(
@@ -445,10 +455,10 @@ class TemporalFusionTransformer(nn.Module):
                 interpretability / visualization.
 
         Returns:
-            logits:
-                Tensor of shape (batch_size, output_size), where output_size=1.
-                These are raw logits; you should apply torch.sigmoid(logits)
-                outside the model when computing probabilities.
+            outputs:
+                Tensor of shape (batch_size, output_size), where for regression
+                output_size = len(config.MODEL_CONFIG.forecast_horizons)
+                (multi-horizon returns).
             attn_weights (optional):
                 Tensor of shape (batch_size, seq_length, seq_length) with
                 attention weights over time. Only returned if
@@ -540,7 +550,7 @@ class TemporalFusionTransformer(nn.Module):
         # ---- Step 5: Aggregate over time ----
         # We take the representation of the LAST time step as summary of the
         # whole history window. This fits the idea: "use last 30 days to
-        # decide if tomorrow is up or down".
+        # predict future returns".
         # last_timestep: (B, H)
         last_timestep = ff_out[:, -1, :]
 
@@ -567,13 +577,15 @@ class TemporalFusionTransformer(nn.Module):
             fusion_output = last_timestep
 
         # ---- Step 7: Final output layer ----
-        # Map to final logits: (B, 1)
-        logits = self.output_layer(fusion_output)
+        # Map to final outputs: (B, output_size)
+        #   - regression: multi-horizon returns
+        #   - classification: logits
+        outputs = self.output_layer(fusion_output)
 
         if return_attention:
-            return logits, attn_weights
+            return outputs, attn_weights
 
-        return logits
+        return outputs
 
 
 if __name__ == "__main__":
@@ -584,6 +596,7 @@ if __name__ == "__main__":
     seq_length = config.SEQ_LENGTH
     input_size = config.MODEL_CONFIG.input_size
     future_input_size = config.MODEL_CONFIG.future_input_size
+    output_size = config.MODEL_CONFIG.output_size
 
     batch_size = 4
     dummy_x_past = torch.randn(batch_size, seq_length, input_size)
@@ -595,7 +608,7 @@ if __name__ == "__main__":
 
     model = TemporalFusionTransformer()
 
-    logits, attn_weights = model(
+    outputs, attn_weights = model(
         dummy_x_past,
         x_future=dummy_x_future,
         return_attention=True,
@@ -606,7 +619,8 @@ if __name__ == "__main__":
         print("Input (future) shape: ", dummy_x_future.shape)   # (B, F_future)
     else:
         print("Input (future):       None")
-    print("Logits shape:          ", logits.shape)            # (B, 1)
+    print("Outputs shape:         ", outputs.shape)           # (B, output_size)
+    print("Expected output_size:  ", output_size)
     print("Attention shape:       ", attn_weights.shape)      # (B, T, T)
     print("Config.use_gating:     ", config.MODEL_CONFIG.use_gating)
     print("Config.use_VSN:        ", config.MODEL_CONFIG.use_variable_selection)

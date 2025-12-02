@@ -16,6 +16,7 @@ import os
 import random
 import time
 import json
+import matplotlib.patheffects as pe
 from typing import Any, Dict, Sequence
 
 import numpy as np
@@ -349,7 +350,7 @@ def plot_confusion_matrix(
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(4, 4))
+    fig, ax = plt.subplots(figsize=(5, 4))
     im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
     ax.figure.colorbar(im, ax=ax)
 
@@ -364,17 +365,36 @@ def plot_confusion_matrix(
     )
 
     # Write counts into cells
+    # Write counts into cells
     fmt = "d"
-    thresh = cm.max() / 2.0
+
+    # Use the colormap's normalization to decide text color:
+    # norm(x) ~ 0 -> very light cell, norm(x) ~ 1 -> very dark cell
+    norm = im.norm
+
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            ax.text(
+            value = cm[i, j]
+            brightness = norm(value)
+
+            # If the cell is light, use black text; if dark, use white text
+            text_color = "black" if brightness < 0.5 else "white"
+
+            txt = ax.text(
                 j,
                 i,
-                format(cm[i, j], fmt),
+                format(value, fmt),
                 ha="center",
                 va="center",
-                color="white" if cm[i, j] > thresh else "black",
+                color=text_color,
+                fontsize=12,
+                fontweight="bold",
+            )
+
+            # Optional: add a thin outline in the opposite color for extra contrast
+            outline_color = "white" if text_color == "black" else "black"
+            txt.set_path_effects(
+                [pe.withStroke(linewidth=1.5, foreground=outline_color)]
             )
 
     fig.tight_layout()

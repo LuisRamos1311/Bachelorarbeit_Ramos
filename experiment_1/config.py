@@ -15,7 +15,7 @@ should import from here instead of hardcoding values.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 
@@ -23,13 +23,19 @@ from typing import List
 # 1. DATA PATHS
 # ============================
 
+# Folder that contains this experiment (…/project_root/experiment_1)
+EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# Root directories (you can change these if needed)
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# Top-level project folder one level above (…/project_root)
+PROJECT_ROOT = os.path.dirname(EXPERIMENT_ROOT)
+
+# Shared data directory at project root
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
-EXPERIMENTS_DIR = os.path.join(PROJECT_ROOT, "experiments")
-PLOTS_DIR = os.path.join(PROJECT_ROOT, "plots")
+
+# Experiment-specific output directories
+MODELS_DIR = os.path.join(EXPERIMENT_ROOT, "models")
+EXPERIMENTS_DIR = os.path.join(EXPERIMENT_ROOT, "experiments")
+PLOTS_DIR = os.path.join(EXPERIMENT_ROOT, "plots")
 
 # Main BTC daily CSV (CryptoDataDownload-style)
 BTC_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_daily.csv")
@@ -58,14 +64,15 @@ TEST_END_DATE = "2024-12-31"
 # -------- Task-level configuration --------
 #
 # TASK_TYPE controls how the rest of the pipeline interprets the target:
-#   - "classification": binary up/down, using target_up
-#   - "regression":    continuous return, using target_return (or similar)
+#   - "classification": binary up/down, using TARGET_COLUMN = "target_up"
+#   - "regression":    continuous returns, using TARGET_RETURN_COLS
 #
-# TARGET_COLUMN is the main label column used when building sequences.
+# TARGET_COLUMN is the main label column used when building sequences
+# when TASK_TYPE == "classification".
 # DIRECTION_LABEL_COLUMN is the binary up/down label derived from returns
 # and used for counts, confusion matrices, etc.
 TASK_TYPE: str = "regression"          # "regression" or "classification"
-TARGET_COLUMN: str = "target_return"   # will be created in data_pipeline.py
+TARGET_COLUMN: str = "target_up"       # main label for classification mode
 DIRECTION_LABEL_COLUMN: str = "target_up"
 
 # Sequence length (number of past days the model sees)
@@ -75,6 +82,13 @@ SEQ_LENGTH = 30  # 30 days of history
 # If future_return > UP_THRESHOLD -> label = 1 (UP), else 0 (DOWN/FLAT)
 # This is used when constructing target_up from future_return_1d.
 UP_THRESHOLD = 0.0
+
+# -------- Multi-horizon forecasting configuration --------
+#
+# We predict multiple future returns in a single forward pass.
+# Example below: 1-day, 3-day and 7-day ahead returns.
+FORECAST_HORIZONS: List[int] = [1, 3, 7]
+
 
 # -------- Core price & indicator features (past covariates) --------
 
@@ -175,9 +189,9 @@ class ModelConfig:
     - multi-head self-attention over the encoded sequence
     - temporal feed-forward / gating blocks (GRNs with GLU)
     - optional known future covariate encoder (calendar + halving for t+1)
-    - final linear layer that outputs one value per sample:
-        * classification: logit (before sigmoid)
-        * regression:     predicted return
+    - final linear layer that outputs one or more values per sample:
+        * classification: logit(s) (before sigmoid)
+        * regression:     predicted return(s) for one or more horizons
     """
 
     # Number of input features per time step (must match FEATURE_COLS length)
@@ -222,8 +236,14 @@ class ModelConfig:
     # Placeholder for future extension with static covariates
     use_static_covariates: bool = False
 
-    # Single output dimension: either logit (classification) or return (regression)
-    output_size: int = 1
+    # Forecast horizons in days (e.g. [1, 3, 7])
+    forecast_horizons: List[int] = field(
+        default_factory=lambda: FORECAST_HORIZONS
+    )
+
+    # Output dimension: one value per forecast horizon for regression,
+    # or per-horizon logits if you ever extend classification to multi-horizon.
+    output_size: int = len(FORECAST_HORIZONS)
 
 
 MODEL_CONFIG = ModelConfig()
@@ -260,6 +280,7 @@ class TrainingConfig:
     # If > 0: clip gradients to this max norm.
     # If <= 0: no clipping applied.
     grad_clip: float = 1.0
+
 
 TRAINING_CONFIG = TrainingConfig()
 

@@ -9,6 +9,7 @@ Main steps:
 3. Add calendar and halving-related features (per day).
 4. Create "next-day" future covariate columns via shift(-1).
 5. Create continuous return target + binary up/down label.
+   (Now also stores multi-horizon returns for config.FORECAST_HORIZONS.)
 6. Split into train / validation / test sets by date.
 7. Scale features (prices & volume with MinMax, indicators with StandardScaler).
 8. Build sliding window sequences for the TFT model (past inputs) and
@@ -23,10 +24,21 @@ import numpy as np
 import pandas as pd
 import torch
 import talib  # Technical Analysis library (C + Python wrapper)
-import config
+from experiment_1 import config
 
 from torch.utils.data import Dataset
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+
+# ============================
+# 0. MULTI-HORIZON LABEL CONFIG
+# ============================
+
+# Canonical list of return-target columns for multi-horizon regression.
+# These must match the columns created in add_target_column().
+TARGET_RETURN_COLS: List[str] = [
+    f"future_return_{h}d" for h in config.FORECAST_HORIZONS
+]
 
 
 # ============================
@@ -304,30 +316,45 @@ def add_future_covariates(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOLD) -> pd.DataFrame:
     """
-    Add continuous and binary targets to the DataFrame:
+    Add continuous and binary targets to the DataFrame.
 
+    Always created:
         - future_return_1d : (close_{t+1} - close_t) / close_t
-        - target_return    : alias for future_return_1d (regression target)
         - target_up        : 1 if future_return_1d > up_threshold else 0
 
-    We drop the last row because it has no "next day" to compare to.
-    This also removes the NaNs created in add_future_covariates().
+    Additionally, for multi-horizon experiments we also create:
+        - future_return_{h}d : (close_{t+h} - close_t) / close_t
+          for each h in config.FORECAST_HORIZONS (e.g. 1, 3, 7).
+
+    Rows that do not have all required future returns defined (e.g. the last
+    few days of the series) are dropped.
     """
     df = df.copy()
 
+    # --- Base 1-day forward return ---
     # pct_change() gives (close_t - close_{t-1}) / close_{t-1}
     # Shift -1 so that at index t we have (close_{t+1} - close_t) / close_t
     df["future_return_1d"] = df["close"].pct_change().shift(-1)
 
-    # Continuous regression target: for now we just reuse the simple pct return.
-    # (If you prefer log-returns later, you can change this line only.)
-    df["target_return"] = df["future_return_1d"]
+    # --- Multi-horizon forward returns ---
+    horizon_cols: List[str] = []
+    for h in config.FORECAST_HORIZONS:
+        col_name = f"future_return_{h}d"
+        if h == 1:
+            # Reuse the already computed 1-day forward return
+            df[col_name] = df["future_return_1d"]
+        else:
+            # (close_{t+h} - close_t) / close_t aligned at day t
+            df[col_name] = (df["close"].shift(-h) - df["close"]) / df["close"]
+        horizon_cols.append(col_name)
 
-    # Binary label: 1 if future return > threshold, else 0
+    # Binary label: 1 if 1-day future return > threshold, else 0
     df["target_up"] = (df["future_return_1d"] > up_threshold).astype(int)
 
-    # Last row will have NaN future_return_1d (and *_next columns), so drop it
-    df = df.dropna(subset=["future_return_1d"])
+    # Drop rows that are missing any of the required future returns
+    # (this removes the tail where there is no t+1, t+3, t+7, etc.).
+    required_cols = list(set(["future_return_1d"] + horizon_cols))
+    df = df.dropna(subset=required_cols)
 
     return df
 
@@ -486,14 +513,20 @@ def build_sequences(
     feature_cols: List[str],
     seq_length: int = config.SEQ_LENGTH,
     future_cols: List[str] | None = None,
-    label_col: str = config.TARGET_COLUMN,
+    label_col: str | None = config.TARGET_COLUMN,
+    target_cols: List[str] | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
     Build sliding-window sequences and labels from a DataFrame.
 
     For each sample:
         - X_past: sequence of length `seq_length` over feature_cols
-        - y:      value of `label_col` at the LAST day in the sequence
+        - y:
+            * if target_cols is None:
+                scalar value of `label_col` at the LAST day in the sequence
+            * if target_cols is not None:
+                vector of shape (H,) with returns for multiple horizons
+                taken from the row at the LAST day in the sequence
         - f:      (optional) vector of future covariates for t+1
 
     We assume:
@@ -501,24 +534,51 @@ def build_sequences(
           (e.g. target_return or target_up)
         - *_next columns at day t already contain information about t+1
           (created via add_future_covariates() using shift(-1)).
+        - when using target_cols, df[target_cols] contains multi-horizon
+          returns like ["future_return_1d", "future_return_3d", ...].
 
     Example:
         If seq_length = 30, we use days [t-29, ..., t] as input,
         and:
-            y = df[label_col] at day t
-            f = future covariates stored at day t (describing t+1).
+            y  = df[label_col] at day t
+            or y_vec = df[target_cols] at day t (multi-horizon)
+            f  = future covariates stored at day t (describing t+1).
     """
-    if label_col not in df.columns:
-        raise ValueError(
-            f"DataFrame must contain '{label_col}' column before building sequences."
-        )
-
     df = df.copy()
     df = df.sort_index()  # ensure chronological order
 
+    # Past covariates
+    missing_feat = [c for c in feature_cols if c not in df.columns]
+    if missing_feat:
+        raise ValueError(
+            f"Missing feature columns in df: {missing_feat}. "
+            "Check indicator and feature generation."
+        )
     feature_array = df[feature_cols].values.astype(np.float32)
-    target_array = df[label_col].values.astype(np.float32)
 
+    # Targets: either scalar (label_col) or multi-horizon (target_cols)
+    if target_cols is not None:
+        for col in target_cols:
+            if col not in df.columns:
+                raise ValueError(
+                    f"Target column '{col}' is missing from df. "
+                    "Make sure add_target_column() was called and config.FORECAST_HORIZONS matches."
+                )
+        target_array = df[target_cols].values.astype(np.float32)  # (N, H)
+        multi_horizon = True
+    else:
+        if label_col is None:
+            raise ValueError(
+                "label_col is None and target_cols is None – at least one must be provided."
+            )
+        if label_col not in df.columns:
+            raise ValueError(
+                f"DataFrame must contain '{label_col}' column before building sequences."
+            )
+        target_array = df[label_col].values.astype(np.float32)     # (N,)
+        multi_horizon = False
+
+    # Future covariates
     if future_cols is not None:
         for col in future_cols:
             if col not in df.columns:
@@ -531,7 +591,7 @@ def build_sequences(
         future_array = None
 
     sequences: List[np.ndarray] = []
-    labels: List[float] = []
+    labels: List[np.ndarray] = []
     future_covariates: List[np.ndarray] = []
 
     # We start at index seq_length-1 because we need seq_length days for the first sample
@@ -540,7 +600,7 @@ def build_sequences(
 
         # Past sequence for days [start_idx, ... end_idx]
         seq_x = feature_array[start_idx: end_idx + 1]   # shape: (seq_length, n_features)
-        y = target_array[end_idx]                       # scalar label at day t=end_idx
+        y = target_array[end_idx]                       # scalar or vector at day t=end_idx
 
         sequences.append(seq_x)
         labels.append(y)
@@ -550,8 +610,12 @@ def build_sequences(
             f = future_array[end_idx]                   # shape: (n_future_features,)
             future_covariates.append(f)
 
-    sequences = np.stack(sequences)          # shape: (num_samples, seq_length, n_features)
-    labels = np.array(labels)                # shape: (num_samples,)
+    sequences_arr = np.stack(sequences)                 # (num_samples, seq_length, n_features)
+
+    if multi_horizon:
+        labels_arr = np.stack(labels)                   # (num_samples, H)
+    else:
+        labels_arr = np.array(labels)                   # (num_samples,)
 
     if future_array is not None:
         future_covariates_arr: np.ndarray | None = np.stack(
@@ -560,7 +624,7 @@ def build_sequences(
     else:
         future_covariates_arr = None
 
-    return sequences, labels, future_covariates_arr
+    return sequences_arr, labels_arr, future_covariates_arr
 
 
 # ============================
@@ -573,7 +637,7 @@ class BTCTFTDataset(Dataset):
 
     Holds:
         - sequences:         numpy array of shape (N, seq_length, n_features)
-        - labels:            numpy array of shape (N,)
+        - labels:            numpy array of shape (N,) or (N, H)
         - future_covariates: optional numpy array of shape (N, n_future_features)
 
     __getitem__ returns:
@@ -599,7 +663,7 @@ class BTCTFTDataset(Dataset):
         else:
             self.future_covariates = None
 
-        self.sequences = torch.from_numpy(sequences)  # float32
+        self.sequences = torch.from_numpy(sequences).float()
         self.labels = torch.from_numpy(labels).float()
 
     def __len__(self) -> int:
@@ -628,11 +692,14 @@ def prepare_datasets(
     3. Add calendar and halving-related base features.
     4. Add next-day future covariate columns via shift(-1).
     5. Add continuous return target + binary direction label.
+       (Also stores multi-horizon future_return_{h}d for later use.)
     6. Print label distribution (per year + overall).
     7. Split by date into train / val / test.
     8. Print label distribution for each split.
     9. Scale features.
     10. Build sequences (past) and per-sample future covariate vectors.
+        - For regression: labels are multi-horizon vectors over FORECAST_HORIZONS.
+        - For classification: labels are scalar (e.g. target_up).
     11. Wrap them into BTCTFTDataset objects.
 
     Returns:
@@ -651,7 +718,7 @@ def prepare_datasets(
     # 4. Add next-day future covariate columns (will be used later for TFT)
     df = add_future_covariates(df)
 
-    # 5. Add continuous + binary targets (this also drops the last row with NaNs)
+    # 5. Add continuous + binary targets (this also drops the last rows with NaNs)
     df = add_target_column(df, up_threshold=config.UP_THRESHOLD)
 
     # 6. Print global label distribution (yearly) using direction label
@@ -681,18 +748,42 @@ def prepare_datasets(
         train_df, val_df, test_df, feature_cols
     )
 
-    # Label column to use when building sequences (regression or classification)
-    label_col = config.TARGET_COLUMN
-
     # 10. Build sequences + future covariate vectors
+    #
+    # For regression (our main TFT setting):
+    #   - Use multi-horizon returns as targets: TARGET_RETURN_COLS.
+    # For classification:
+    #   - Use scalar label column specified in config.TARGET_COLUMN (e.g. "target_up").
+    if config.TASK_TYPE == "regression":
+        label_col = None
+        target_cols = TARGET_RETURN_COLS
+    else:
+        label_col = config.TARGET_COLUMN
+        target_cols = None
+
     train_seq, train_labels, train_future = build_sequences(
-        train_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        train_df_scaled,
+        feature_cols,
+        seq_length,
+        future_cols=future_cols,
+        label_col=label_col,
+        target_cols=target_cols,
     )
     val_seq, val_labels, val_future = build_sequences(
-        val_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        val_df_scaled,
+        feature_cols,
+        seq_length,
+        future_cols=future_cols,
+        label_col=label_col,
+        target_cols=target_cols,
     )
     test_seq, test_labels, test_future = build_sequences(
-        test_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        test_df_scaled,
+        feature_cols,
+        seq_length,
+        future_cols=future_cols,
+        label_col=label_col,
+        target_cols=target_cols,
     )
 
     # 11. Wrap into Datasets
@@ -717,7 +808,7 @@ if __name__ == "__main__":
       - Print label distributions per year (full + splits)
       - Inspect the first training sample:
           * its shape
-          * its label (regression target or binary label, depending on config.TARGET_COLUMN)
+          * its label (regression target or binary label, depending on config.TASK_TYPE)
           * future covariate vector (if present)
           * first 3 timesteps of the sequence
           * last 3 timesteps of the sequence
@@ -746,7 +837,10 @@ if __name__ == "__main__":
     print(f"One sample X shape:       {x.shape}  (seq_length, n_features)")
     if future is not None:
         print(f"One sample future shape:  {future.shape}  (n_future_features,)")
-    print(f"One sample y:             {y.item()}")
+
+    # y can be scalar (classification) or vector (multi-horizon regression)
+    print(f"One sample y shape:       {tuple(y.shape)}")
+    print(f"One sample y values:      {y.numpy()}")
 
     # Convert to numpy for nicer printing (still scaled values!)
     x_np = x.numpy()
