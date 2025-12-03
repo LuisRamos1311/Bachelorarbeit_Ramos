@@ -2,7 +2,7 @@
 tft_model.py
 
 Defines a simplified Temporal Fusion Transformer-style model for
-multi-horizon BTC return forecasting.
+logits or outputs for the configured task.
 
 Current architecture (with optional VSNs, gating and known future inputs):
 
@@ -13,9 +13,6 @@ Current architecture (with optional VSNs, gating and known future inputs):
 4. Temporal feed-forward / gating block (Gated Residual Networks or
    residual MLP).
 5. Optional future covariate encoder (calendar + halving info for t+1).
-6. Aggregation over time (we use the last time step), optional fusion
-   with future context, and a final linear layer to output a vector of
-   horizon-wise predicted returns.
 
 Other modules (train_tft.py, evaluate_tft.py, etc.) should treat this as a
 standard PyTorch model:
@@ -264,11 +261,6 @@ class TemporalFusionTransformer(nn.Module):
         outputs:
             Tensor of shape (batch_size, output_size)
 
-            - For regression (main thesis setting):
-                output_size = len(config.MODEL_CONFIG.forecast_horizons),
-                each entry is a predicted return for a given horizon
-                (e.g. [r_1d, r_3d, r_7d]).
-
             - For classification (if you ever reconfigure):
                 entries can be interpreted as logits.
 
@@ -456,9 +448,7 @@ class TemporalFusionTransformer(nn.Module):
 
         Returns:
             outputs:
-                Tensor of shape (batch_size, output_size), where for regression
-                output_size = len(config.MODEL_CONFIG.forecast_horizons)
-                (multi-horizon returns).
+                Tensor of shape (batch_size, output_size) – classification logits.
             attn_weights (optional):
                 Tensor of shape (batch_size, seq_length, seq_length) with
                 attention weights over time. Only returned if
@@ -586,46 +576,3 @@ class TemporalFusionTransformer(nn.Module):
             return outputs, attn_weights
 
         return outputs
-
-
-if __name__ == "__main__":
-    # Small sanity check that the model runs end-to-end on dummy data.
-    torch.manual_seed(0)
-
-    # Use settings from config.py
-    seq_length = config.SEQ_LENGTH
-    input_size = config.MODEL_CONFIG.input_size
-    future_input_size = config.MODEL_CONFIG.future_input_size
-    output_size = config.MODEL_CONFIG.output_size
-
-    batch_size = 4
-    dummy_x_past = torch.randn(batch_size, seq_length, input_size)
-
-    if config.MODEL_CONFIG.use_future_covariates and future_input_size > 0:
-        dummy_x_future = torch.randn(batch_size, future_input_size)
-    else:
-        dummy_x_future = None
-
-    model = TemporalFusionTransformer()
-
-    outputs, attn_weights = model(
-        dummy_x_past,
-        x_future=dummy_x_future,
-        return_attention=True,
-    )
-
-    print("Input (past) shape:   ", dummy_x_past.shape)       # (B, T, input_size)
-    if dummy_x_future is not None:
-        print("Input (future) shape: ", dummy_x_future.shape)   # (B, F_future)
-    else:
-        print("Input (future):       None")
-    print("Outputs shape:         ", outputs.shape)           # (B, output_size)
-    print("Expected output_size:  ", output_size)
-    print("Attention shape:       ", attn_weights.shape)      # (B, T, T)
-    print("Config.use_gating:     ", config.MODEL_CONFIG.use_gating)
-    print("Config.use_VSN:        ", config.MODEL_CONFIG.use_variable_selection)
-    print("Config.use_future_covs:", config.MODEL_CONFIG.use_future_covariates)
-    if model.last_vsn_weights is not None:
-        print("VSN weights shape:    ", model.last_vsn_weights.shape)  # (B, T, F)
-    else:
-        print("VSN weights:          None (variable selection disabled)")

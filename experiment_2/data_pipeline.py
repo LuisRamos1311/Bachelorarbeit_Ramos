@@ -1,19 +1,20 @@
 """
 data_pipeline.py
 
-Turns raw daily BTC price data into PyTorch Datasets for the TFT model.
+Turns raw daily BTC price data into PyTorch Datasets for the TFT model
+used in Experiment 2 (3-class direction classification).
 
 Main steps:
 1. Load daily BTC price data from CSV.
 2. Add technical indicators (ROC, ATR, MACD, RSI).
 3. Add calendar and halving-related features (per day).
 4. Create "next-day" future covariate columns via shift(-1).
-5. Create continuous return target + binary up/down label.
-   (Now also stores multi-horizon returns for config.FORECAST_HORIZONS.)
+5. Create the 1-day forward return and a 3-class direction label
+   (DOWN / FLAT / UP) based on a symmetric return threshold.
 6. Split into train / validation / test sets by date.
 7. Scale features (prices & volume with MinMax, indicators with StandardScaler).
-8. Build sliding window sequences for the TFT model (past inputs) and
-   per-sample future covariate vectors.
+8. Build sliding window sequences for the TFT model (past inputs)
+   and per-sample future covariate vectors for t+1.
 9. Provide a BTCTFTDataset class to be used in train_tft.py and evaluate_tft.py.
 """
 
@@ -25,21 +26,9 @@ import pandas as pd
 import torch
 import talib  # Technical Analysis library (C + Python wrapper)
 from experiment_2 import config
-from experiment_2.config import TASK_TYPE
 
 from torch.utils.data import Dataset
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-
-
-# ============================
-# 0. MULTI-HORIZON LABEL CONFIG
-# ============================
-
-# Canonical list of return-target columns for multi-horizon regression.
-# These must match the columns created in add_target_column().
-TARGET_RETURN_COLS: List[str] = [
-    f"future_return_{h}d" for h in config.FORECAST_HORIZONS
-]
 
 
 # ============================
@@ -315,20 +304,36 @@ def add_future_covariates(df: pd.DataFrame) -> pd.DataFrame:
 # 4. TARGETS (RETURN + UP/DOWN)
 # ============================
 
-def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOLD) -> pd.DataFrame:
+def add_target_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add continuous and binary targets to the DataFrame.
+    Add the 1-day forward return and the 3-class direction label.
 
-    Always created:
-        - future_return_1d : (close_{t+1} - close_t) / close_t
-        - target_up        : 1 if future_return_1d > up_threshold else 0
+    Created columns:
+      - future_return_1d:
+          (close_{t+1} - close_t) / close_t, aligned at day t.
+          This is used for analysis but not directly as the model target
+          in Experiment 2.
 
-    Additionally, for multi-horizon experiments we also create:
-        - future_return_{h}d : (close_{t+h} - close_t) / close_t
-          for each h in config.FORECAST_HORIZONS (e.g. 1, 3, 7).
+      - direction_3c (config.TRIPLE_DIRECTION_COLUMN):
+          Integer-encoded 3-class direction label based on the
+          1-day forward return and a symmetric threshold tau:
 
-    Rows that do not have all required future returns defined (e.g. the last
-    few days of the series) are dropped.
+              0 = DOWN  if future_return_1d < -DIRECTION_THRESHOLD
+              1 = FLAT  if |future_return_1d| <= DIRECTION_THRESHOLD
+              2 = UP    if future_return_1d >  DIRECTION_THRESHOLD
+
+    After creating these columns, rows with NaN future_return_1d
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with at least a 'close' price column and a DatetimeIndex.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input DataFrame with 'future_return_1d' and the
+        3-class direction label added, and trailing NaN rows removed.
     """
     df = df.copy()
 
@@ -336,22 +341,6 @@ def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOL
     # pct_change() gives (close_t - close_{t-1}) / close_{t-1}
     # Shift -1 so that at index t we have (close_{t+1} - close_t) / close_t
     df["future_return_1d"] = df["close"].pct_change().shift(-1)
-
-    # --- Multi-horizon forward returns ---
-    horizon_cols: List[str] = []
-    for h in config.FORECAST_HORIZONS:
-        col_name = f"future_return_{h}d"
-        if h == 1:
-            # Reuse the already computed 1-day forward return
-            df[col_name] = df["future_return_1d"]
-        else:
-            # (close_{t+h} - close_t) / close_t aligned at day t
-            df[col_name] = (df["close"].shift(-h) - df["close"]) / df["close"]
-        horizon_cols.append(col_name)
-
-    # Binary label (Experiment 1 / baseline):
-    # 1 if 1-day future return > threshold, else 0
-    df["target_up"] = (df["future_return_1d"] > up_threshold).astype(int)
 
     # --- NEW: 3-class direction label for Experiment 2 ---
     #
@@ -370,10 +359,8 @@ def add_target_column(df: pd.DataFrame, up_threshold: float = config.UP_THRESHOL
 
     df[config.TRIPLE_DIRECTION_COLUMN] = direction_3c
 
-    # Drop rows that are missing any of the required future returns
-    # (this removes the tail where there is no t+1, t+3, t+7, etc.).
-    required_cols = list(set(["future_return_1d"] + horizon_cols))
-    df = df.dropna(subset=required_cols)
+    # Drop rows where future_return_1d is NaN (e.g. last row)
+    df = df.dropna(subset=["future_return_1d"])
 
     return df
 
@@ -387,8 +374,14 @@ def print_label_distribution(
     Print DOWN / FLAT / UP counts (and percentages) aggregated over time.
 
     Uses the column specified in config.DIRECTION_LABEL_COLUMN, which in
-    Experiment 2 is the 3-class label:
-        0 = DOWN, 1 = FLAT, 2 = UP
+    Experiment 2 is the 3-class direction label:
+
+        0 = DOWN
+        1 = FLAT
+        2 = UP
+
+    The DataFrame is grouped by a time frequency (default: yearly) and the
+    distribution of labels is printed for each period and overall.
     """
     direction_col = config.DIRECTION_LABEL_COLUMN
 
@@ -546,35 +539,49 @@ def build_sequences(
     seq_length: int = config.SEQ_LENGTH,
     future_cols: List[str] | None = None,
     label_col: str | None = config.TARGET_COLUMN,
-    target_cols: List[str] | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
-    Build sliding-window sequences and labels from a DataFrame.
+    Build sliding-window sequences and labels from a DataFrame for classification.
 
-    For each sample:
-        - X_past: sequence of length `seq_length` over feature_cols
-        - y:
-            * if target_cols is None:
-                scalar value of `label_col` at the LAST day in the sequence
-            * if target_cols is not None:
-                vector of shape (H,) with returns for multiple horizons
-                taken from the row at the LAST day in the sequence
-        - f:      (optional) vector of future covariates for t+1
+    For each sample, we create:
+      - X_past: sequence of length `seq_length` over `feature_cols`
+      - y:      scalar integer label taken from `label_col` at the LAST day
+                in the sequence (e.g. direction_3c for Experiment 2)
+      - f:      (optional) vector of future covariates for t+1 taken from
+                `future_cols` at the LAST day in the sequence
 
-    We assume:
-        - label_col at day t encodes what happens from t -> t+1
-          (e.g. target_return or target_up)
-        - *_next columns at day t already contain information about t+1
-          (created via add_future_covariates() using shift(-1)).
-        - when using target_cols, df[target_cols] contains multi-horizon
-          returns like ["future_return_1d", "future_return_3d", ...].
+    Indexing convention:
+      - The DataFrame is assumed to be sorted in chronological order.
+      - If seq_length = 30 and the current end index is t, then
+          X_past uses rows [t-29, ..., t]
+          y      is df[label_col] at index t
+          f      is df[future_cols] at index t (describing day t+1)
 
-    Example:
-        If seq_length = 30, we use days [t-29, ..., t] as input,
-        and:
-            y  = df[label_col] at day t
-            or y_vec = df[target_cols] at day t (multi-horizon)
-            f  = future covariates stored at day t (describing t+1).
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame with scaled feature columns and label column.
+    feature_cols : list of str
+        Column names used as past covariates.
+    seq_length : int
+        Number of past timesteps in each sequence.
+    future_cols : list of str or None
+        Column names used as known future covariates for t+1
+        (e.g. dow_next, is_weekend_next, ...). If None, no future
+        covariate vector is returned.
+    label_col : str or None
+        Name of the classification label column, e.g. config.TARGET_COLUMN
+        pointing to the 3-class direction label.
+
+    Returns
+    -------
+    sequences : np.ndarray
+        Array of shape (N, seq_length, num_features) with past covariates.
+    labels : np.ndarray
+        Array of shape (N,) with integer class labels.
+    future_covariates : np.ndarray or None
+        If future_cols is not None, an array of shape (N, num_future_features)
+        with known future covariates for t+1; otherwise None.
     """
     df = df.copy()
     df = df.sort_index()  # ensure chronological order
@@ -588,33 +595,16 @@ def build_sequences(
         )
     feature_array = df[feature_cols].values.astype(np.float32)
 
-    # Targets: either scalar (label_col) or multi-horizon (target_cols)
-    if target_cols is not None:
-        for col in target_cols:
-            if col not in df.columns:
-                raise ValueError(
-                    f"Target column '{col}' is missing from df. "
-                    "Make sure add_target_column() was called and config.FORECAST_HORIZONS matches."
-                )
-        target_array = df[target_cols].values.astype(np.float32)  # (N, H)
-        multi_horizon = True
-    else:
-        if label_col is None:
-            raise ValueError(
-                "label_col is None and target_cols is None – at least one must be provided."
-            )
-        if label_col not in df.columns:
-            raise ValueError(
-                f"DataFrame must contain '{label_col}' column before building sequences."
-            )
-        if TASK_TYPE == "classification":
-            # direction_3c: 0 = DOWN, 1 = FLAT, 2 = UP
-            target_array = df[label_col].values.astype(np.int64)
-        else:
-            # regression targets (returns)
-            target_array = df[label_col].values.astype(np.float32)
+    # Targets: scalar classification label (direction_3c)
+    if label_col is None:
+        raise ValueError("label_col must be provided for classification.")
+    if label_col not in df.columns:
+        raise ValueError(
+            f"DataFrame must contain '{label_col}' column before building sequences."
+        )
 
-        multi_horizon = False
+    # direction_3c: 0 = DOWN, 1 = FLAT, 2 = UP
+    target_array = df[label_col].values.astype(np.int64)
 
     # Future covariates
     if future_cols is not None:
@@ -648,12 +638,8 @@ def build_sequences(
             f = future_array[end_idx]                   # shape: (n_future_features,)
             future_covariates.append(f)
 
-    sequences_arr = np.stack(sequences)                 # (num_samples, seq_length, n_features)
-
-    if multi_horizon:
-        labels_arr = np.stack(labels)                   # (num_samples, H)
-    else:
-        labels_arr = np.array(labels)                   # (num_samples,)
+    sequences_arr = np.stack(sequences)  # (num_samples, seq_length, n_features)
+    labels_arr = np.array(labels)  # (num_samples,)
 
     if future_array is not None:
         future_covariates_arr: np.ndarray | None = np.stack(
@@ -671,18 +657,23 @@ def build_sequences(
 
 class BTCTFTDataset(Dataset):
     """
-    Simple PyTorch Dataset for BTC TFT model.
+    Simple PyTorch Dataset for the BTC TFT model in Experiment 2.
 
-    Holds:
-        - sequences:         numpy array of shape (N, seq_length, n_features)
-        - labels:            numpy array of shape (N,) or (N, H)
-        - future_covariates: optional numpy array of shape (N, n_future_features)
+    Each item represents a single training sample:
+      - sequences: past covariates of shape (seq_length, num_features)
+      - labels:    scalar integer class in {0, 1, 2}
+                   (0 = DOWN, 1 = FLAT, 2 = UP)
+      - future_covariates (optional): known future covariates for t+1
+        of shape (num_future_features,)
+
+    Shapes stored internally:
+      - sequences:       (N, seq_length, num_features)
+      - labels:          (N,)
+      - future_covariates (if present): (N, num_future_features)
 
     __getitem__ returns:
-        If future_covariates is None:
-            X, y
-        else:
-            X_past, X_future, y
+      - (X, y) if future_covariates is None
+      - (X_past, X_future, y) otherwise
     """
 
     def __init__(
@@ -702,12 +693,8 @@ class BTCTFTDataset(Dataset):
             self.future_covariates = None
 
         self.sequences = torch.from_numpy(sequences).float()
-
-        if TASK_TYPE == "classification":
-            # Long dtype for CrossEntropyLoss (class indices)
-            self.labels = torch.from_numpy(labels).long()
-        else:
-            self.labels = torch.from_numpy(labels).float()
+        # Long dtype for CrossEntropyLoss (class indices)
+        self.labels = torch.from_numpy(labels).long()
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -728,25 +715,48 @@ def prepare_datasets(
     seq_length: int = config.SEQ_LENGTH,
 ) -> Tuple[BTCTFTDataset, BTCTFTDataset, BTCTFTDataset, Dict[str, object]]:
     """
-    High-level function that runs the whole pipeline:
+    High-level function that runs the full data pipeline for Experiment 2.
 
-    1. Load BTC daily data.
-    2. Add technical indicators.
-    3. Add calendar and halving-related base features.
-    4. Add next-day future covariate columns via shift(-1).
-    5. Add continuous return target + binary direction label.
-       (Also stores multi-horizon future_return_{h}d for later use.)
-    6. Print label distribution (per year + overall).
-    7. Split by date into train / val / test.
-    8. Print label distribution for each split.
-    9. Scale features.
-    10. Build sequences (past) and per-sample future covariate vectors.
-        - For regression: labels are multi-horizon vectors over FORECAST_HORIZONS.
-        - For classification: labels are scalar (e.g. target_up).
-    11. Wrap them into BTCTFTDataset objects.
+    Steps:
+      1. Load BTC daily OHLCV data from CSV.
+      2. Add technical indicators (ROC, ATR, MACD, RSI).
+      3. Add calendar and halving-related base features (per day).
+      4. Add next-day future covariate columns via shift(-1) for:
+           - dow_next, is_weekend_next, month_next, is_halving_window_next
+      5. Add 1-day forward return (future_return_1d) and the 3-class
+         direction label (DOWN / FLAT / UP) based on config.DIRECTION_THRESHOLD.
+      6. Print label distribution (per year + overall) using the 3-class label.
+      7. Split by date into train / val / test using config date ranges.
+      8. Print label distribution for each split.
+      9. Scale past covariates (MinMax for price/volume, StandardScaler
+         for indicators).
+     10. Build sliding-window sequences for past covariates and per-sample
+         future covariate vectors for t+1, using the 3-class label as y.
+     11. Wrap them into BTCTFTDataset objects.
 
-    Returns:
-        train_dataset, val_dataset, test_dataset, scalers_dict
+    Parameters
+    ----------
+    csv_path : str or None
+        Path to the BTC daily CSV file. If None, uses
+        config.BTC_DAILY_CSV_PATH.
+    seq_length : int
+        Number of past days in each input sequence.
+
+    Returns
+    -------
+    train_dataset : BTCTFTDataset
+        Dataset for the training split.
+    val_dataset : BTCTFTDataset
+        Dataset for the validation split.
+    test_dataset : BTCTFTDataset
+        Dataset for the test split.
+    scalers_dict : dict
+        Dictionary containing fitted scalers and metadata:
+          - "price_volume_scaler"
+          - "indicator_scaler"
+          - "feature_cols"
+          - "price_volume_cols"
+          - "indicator_cols"
     """
     # 1. Load
     df = load_btc_daily(csv_path)
@@ -761,8 +771,8 @@ def prepare_datasets(
     # 4. Add next-day future covariate columns (will be used later for TFT)
     df = add_future_covariates(df)
 
-    # 5. Add continuous + binary targets (this also drops the last rows with NaNs)
-    df = add_target_column(df, up_threshold=config.UP_THRESHOLD)
+    # 5. Add continuous return + 3-class direction label (drops last rows with NaNs)
+    df = add_target_column(df)
 
     # 6. Print global label distribution (yearly) using direction label
     print_label_distribution(df, name="FULL", freq="Y")
@@ -793,16 +803,7 @@ def prepare_datasets(
 
     # 10. Build sequences + future covariate vectors
     #
-    # For regression (our main TFT setting):
-    #   - Use multi-horizon returns as targets: TARGET_RETURN_COLS.
-    # For classification:
-    #   - Use scalar label column specified in config.TARGET_COLUMN (e.g. "target_up").
-    if config.TASK_TYPE == "regression":
-        label_col = None
-        target_cols = TARGET_RETURN_COLS
-    else:
-        label_col = config.TARGET_COLUMN
-        target_cols = None
+    label_col = config.TARGET_COLUMN
 
     train_seq, train_labels, train_future = build_sequences(
         train_df_scaled,
@@ -810,7 +811,6 @@ def prepare_datasets(
         seq_length,
         future_cols=future_cols,
         label_col=label_col,
-        target_cols=target_cols,
     )
     val_seq, val_labels, val_future = build_sequences(
         val_df_scaled,
@@ -818,7 +818,6 @@ def prepare_datasets(
         seq_length,
         future_cols=future_cols,
         label_col=label_col,
-        target_cols=target_cols,
     )
     test_seq, test_labels, test_future = build_sequences(
         test_df_scaled,
@@ -826,7 +825,6 @@ def prepare_datasets(
         seq_length,
         future_cols=future_cols,
         label_col=label_col,
-        target_cols=target_cols,
     )
 
     # 11. Wrap into Datasets

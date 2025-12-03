@@ -34,7 +34,6 @@ from experiment_2.config import (
     EXPERIMENTS_DIR,
     PLOTS_DIR,
     TASK_TYPE,
-    UP_THRESHOLD,
     NUM_CLASSES,
 )
 from experiment_2.data_pipeline import prepare_datasets
@@ -157,18 +156,6 @@ def run_epoch(
                 y_for_metrics = y_flat
                 out_for_metrics = logits
 
-            elif TASK_TYPE == "regression":
-                # Multi-horizon regression:
-                #   outputs: (B, H)
-                #   y:       (B, H)
-                # MSELoss will average over all horizons.
-                loss = criterion(outputs, y)
-
-                # For metrics we keep the full (B, H) tensors;
-                # compute_regression_metrics will flatten later.
-                y_for_metrics = y
-                out_for_metrics = outputs
-
             else:
                 raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
 
@@ -211,16 +198,6 @@ def run_epoch(
         )
         metrics["loss"] = float(avg_loss)
 
-    elif TASK_TYPE == "regression":
-        # Use raw outputs as predicted returns.
-        # compute_regression_metrics will internally flatten (N, H) -> (N*H,)
-        # for aggregate MSE/RMSE/MAE/R^2 + directional metrics.
-        metrics = utils.compute_regression_metrics(
-            y_true=y_true_all,
-            y_pred=y_out_all,
-            direction_threshold=UP_THRESHOLD,
-        )
-        metrics["loss"] = float(avg_loss)
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
 
@@ -265,9 +242,6 @@ def main() -> None:
         # You can later add class weights here if needed.
         criterion = torch.nn.CrossEntropyLoss()
         print(f"[train_tft] Using CrossEntropyLoss for {NUM_CLASSES}-class classification.")
-    elif TASK_TYPE == "regression":
-        criterion = torch.nn.MSELoss()
-        print("[train_tft] Using MSELoss for regression on continuous returns.")
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
@@ -310,27 +284,6 @@ def main() -> None:
         best_val_metric = -1.0
         selection_mode = "max"
         print("[train_tft] Model selection metric: Val F1 (maximize).")
-    elif TASK_TYPE == "regression":
-        history.update(
-            {
-                "train_mse": [],
-                "val_mse": [],
-                "train_mae": [],
-                "val_mae": [],
-                "train_rmse": [],
-                "val_rmse": [],
-                "train_r2": [],
-                "val_r2": [],
-                "train_direction_accuracy": [],
-                "val_direction_accuracy": [],
-                "train_direction_f1": [],
-                "val_direction_f1": [],
-            }
-        )
-        selection_metric_name = "rmse"
-        best_val_metric = float("inf")
-        selection_mode = "min"
-        print("[train_tft] Model selection metric: Val RMSE (minimize).")
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
@@ -387,30 +340,6 @@ def main() -> None:
                 f"Train F1={train_metrics['f1']:.4f}, "
                 f"Val F1={val_metrics['f1']:.4f}, "
                 f"Val Acc={val_metrics['accuracy']:.4f}"
-            )
-
-        elif TASK_TYPE == "regression":
-            history["train_mse"].append(train_metrics["mse"])
-            history["val_mse"].append(val_metrics["mse"])
-            history["train_mae"].append(train_metrics["mae"])
-            history["val_mae"].append(val_metrics["mae"])
-            history["train_rmse"].append(train_metrics["rmse"])
-            history["val_rmse"].append(val_metrics["rmse"])
-            history["train_r2"].append(train_metrics["r2"])
-            history["val_r2"].append(val_metrics["r2"])
-            history["train_direction_accuracy"].append(train_metrics["direction_accuracy"])
-            history["val_direction_accuracy"].append(val_metrics["direction_accuracy"])
-            history["train_direction_f1"].append(train_metrics["direction_f1"])
-            history["val_direction_f1"].append(val_metrics["direction_f1"])
-
-            print(
-                f"[train_tft][Epoch {epoch}] "
-                f"Train loss={train_metrics['loss']:.6f}, "
-                f"Val loss={val_metrics['loss']:.6f}, "
-                f"Train RMSE={train_metrics['rmse']:.6f}, "
-                f"Val RMSE={val_metrics['rmse']:.6f}, "
-                f"Val DirAcc={val_metrics['direction_accuracy']:.4f}, "
-                f"Val DirF1={val_metrics['direction_f1']:.4f}"
             )
 
         # --- Model selection ---

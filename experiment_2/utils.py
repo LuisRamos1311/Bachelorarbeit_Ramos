@@ -29,7 +29,6 @@ from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix,
     roc_curve,
-    r2_score,
 )
 import matplotlib.pyplot as plt
 
@@ -235,69 +234,7 @@ def compute_multiclass_metrics(
 
 
 # ============================================================
-# 4. REGRESSION METRICS (for continuous returns)
-# ============================================================
-
-def compute_regression_metrics(
-    y_true: Any,
-    y_pred: Any,
-    direction_threshold: float = 0.0,
-) -> Dict[str, float]:
-    """
-    Compute regression metrics for continuous targets (e.g., returns),
-    plus directional accuracy/F1 based on the sign of predictions.
-
-    Args:
-        y_true:
-            Ground-truth continuous values (e.g., 1-day forward returns).
-        y_pred:
-            Predicted continuous values (same shape as y_true).
-        direction_threshold:
-            Threshold used to classify a value as "UP" (1) vs "DOWN" (0).
-            Typically 0.0: positive return => UP, else DOWN.
-
-    Returns:
-        Dictionary with mse, mae, rmse, r2, direction_accuracy, direction_f1.
-    """
-    y_true_arr = _to_numpy_1d(y_true).astype(float)
-    y_pred_arr = _to_numpy_1d(y_pred).astype(float)
-
-    if y_true_arr.shape != y_pred_arr.shape:
-        raise ValueError(
-            f"y_true and y_pred must have the same shape, "
-            f"got {y_true_arr.shape} vs {y_pred_arr.shape}"
-        )
-
-    diff = y_true_arr - y_pred_arr
-    mse = float(np.mean(diff ** 2))
-    mae = float(np.mean(np.abs(diff)))
-    rmse = float(np.sqrt(mse))
-
-    # R^2 can fail if y_true has zero variance; handle gracefully
-    try:
-        r2 = float(r2_score(y_true_arr, y_pred_arr))
-    except ValueError:
-        r2 = float("nan")
-
-    # Directional metrics: compare sign relative to threshold
-    y_true_dir = (y_true_arr > direction_threshold).astype(int)
-    y_pred_dir = (y_pred_arr > direction_threshold).astype(int)
-
-    direction_acc = float(accuracy_score(y_true_dir, y_pred_dir))
-    direction_f1 = float(f1_score(y_true_dir, y_pred_dir, zero_division=0))
-
-    return {
-        "mse": mse,
-        "mae": mae,
-        "rmse": rmse,
-        "r2": r2,
-        "direction_accuracy": direction_acc,
-        "direction_f1": direction_f1,
-    }
-
-
-# ============================================================
-# 5. TRAINING CURVE PLOTTING
+# 4. TRAINING CURVE PLOTTING
 # ============================================================
 
 def plot_training_curves(history: Dict[str, Sequence[float]], out_path: str) -> None:
@@ -376,7 +313,7 @@ def plot_training_curves(history: Dict[str, Sequence[float]], out_path: str) -> 
 
 
 # ============================================================
-# 6. CONFUSION MATRIX & ROC CURVE PLOTTING
+# 5. CONFUSION MATRIX & ROC CURVE PLOTTING
 # ============================================================
 
 def plot_confusion_matrix(
@@ -526,7 +463,7 @@ def plot_roc_curve(
 
 
 # ============================================================
-# 7. SCORE / PROBABILITY HISTOGRAM
+# 6. SCORE / PROBABILITY HISTOGRAM
 # ============================================================
 
 def plot_probability_histogram(

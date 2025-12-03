@@ -86,9 +86,6 @@ DIRECTION_LABEL_COLUMN: str = TRIPLE_DIRECTION_COLUMN
 # Sequence length (number of past days the model sees)
 SEQ_LENGTH = 30  # 30 days of history
 
-# Threshold for calling a move "up" (used only for target_up baseline)
-UP_THRESHOLD = 0.0
-
 # -------- Multi-horizon forecasting configuration --------
 #
 # We predict multiple future returns in a single forward pass.
@@ -257,9 +254,6 @@ MODEL_CONFIG = ModelConfig()
 if TASK_TYPE == "classification":
     # 3-class UP / FLAT / DOWN
     MODEL_CONFIG.output_size = NUM_CLASSES
-else:
-    # multi-horizon regression: one output per forecast horizon
-    MODEL_CONFIG.output_size = len(FORECAST_HORIZONS)
 
 
 # ============================
