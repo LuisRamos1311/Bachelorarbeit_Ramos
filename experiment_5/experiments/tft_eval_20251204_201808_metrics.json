@@ -1,0 +1,49 @@
+{
+  "task_type": "classification",
+  "num_classes": 3,
+  "class_encoding": {
+    "0": "DOWN",
+    "1": "FLAT",
+    "2": "UP"
+  },
+  "label_config": {
+    "use_log_returns": true,
+    "direction_threshold": 0.005,
+    "forecast_horizons": [
+      1
+    ],
+    "use_multi_horizon": false
+  },
+  "val_loss_ce": 1.2379289412710717,
+  "test_loss_ce": 1.291987765434734,
+  "val_multiclass": {
+    "accuracy": 0.3916913946587537,
+    "precision": 0.3718157523725354,
+    "recall": 0.3845096270685357,
+    "f1": 0.3750634333768305,
+    "auc": 0.5064761332759865
+  },
+  "test_multiclass": {
+    "accuracy": 0.4106145251396648,
+    "precision": 0.417603807829388,
+    "recall": 0.3767688601232018,
+    "f1": 0.36698505076429316,
+    "auc": 0.5475282002685079
+  },
+  "up_class_index": 2,
+  "up_prob_threshold": 0.1,
+  "val_up_vs_rest": {
+    "accuracy": 0.486646884272997,
+    "precision": 0.4864864864864865,
+    "recall": 0.9878048780487805,
+    "f1": 0.6519114688128773,
+    "auc": 0.47331876497955727
+  },
+  "test_up_vs_rest": {
+    "accuracy": 0.4175977653631285,
+    "precision": 0.40015015015015015,
+    "recall": 0.9383802816901409,
+    "f1": 0.5610526315789474,
+    "auc": 0.4962241621022431
+  }
+}

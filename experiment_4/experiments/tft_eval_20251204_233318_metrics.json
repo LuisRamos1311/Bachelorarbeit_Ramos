@@ -1,0 +1,35 @@
+{
+  "task_type": "classification",
+  "num_classes": 2,
+  "class_encoding": {
+    "0": "DOWN",
+    "1": "UP"
+  },
+  "label_config": {
+    "use_log_returns": true,
+    "direction_threshold": 0.005,
+    "forecast_horizons": [
+      1
+    ],
+    "use_multi_horizon": false,
+    "binary_big_move": true
+  },
+  "up_class_index": 1,
+  "probability_threshold": 0.1,
+  "val_loss_ce": 0.7073769222760031,
+  "test_loss_ce": 0.7166325252323864,
+  "val_binary": {
+    "accuracy": 0.5815602836879432,
+    "precision": 0.5815602836879432,
+    "recall": 1.0,
+    "f1": 0.7354260089686099,
+    "auc": 0.4372157916494419
+  },
+  "test_binary": {
+    "accuracy": 0.5062388591800356,
+    "precision": 0.5062388591800356,
+    "recall": 1.0,
+    "f1": 0.672189349112426,
+    "auc": 0.49890679818986117
+  }
+}
