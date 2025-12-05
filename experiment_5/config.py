@@ -23,7 +23,7 @@ from typing import List
 # 1. DATA PATHS
 # ============================
 
-# Folder that contains this experiment (…/project_root/experiment_3)
+# Folder that contains this experiment (…/project_root/experiment_5)
 EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Top-level project folder one level above (…/project_root)

@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from experiment_3 import config
+from experiment_5 import config
 
 
 # ============================

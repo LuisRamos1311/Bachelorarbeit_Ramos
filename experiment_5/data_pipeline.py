@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import torch
 import talib  # Technical Analysis library (C + Python wrapper)
-from experiment_3 import config
+from experiment_5 import config
 
 from torch.utils.data import Dataset
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
