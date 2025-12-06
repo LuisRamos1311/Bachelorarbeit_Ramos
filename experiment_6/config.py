@@ -12,6 +12,11 @@ This file groups together:
 
 Other modules (data_pipeline.py, train_tft.py, tft_model.py, etc.)
 should import from here instead of hardcoding values.
+
+Experiment 6:
+- 1-hour BTC candles
+- SEQ_LENGTH in hours (e.g. 96 = 4 days of history)
+- FORECAST_HORIZONS in steps (e.g. [24] = next 24 hours)
 """
 
 import os
@@ -23,7 +28,7 @@ from typing import List
 # 1. DATA PATHS
 # ============================
 
-# Folder that contains this experiment (…/project_root/experiment_5)
+# Folder that contains this experiment (…/project_root/experiment_6)
 EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Top-level project folder one level above (…/project_root)
@@ -40,67 +45,76 @@ PLOTS_DIR = os.path.join(EXPERIMENT_ROOT, "plots")
 # Main BTC daily CSV (CryptoDataDownload-style)
 BTC_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_daily.csv")
 
+# NEW: BTC hourly CSV (for Experiment 6)
+BTC_HOURLY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_hourly.csv")
+
+# Optional flag describing the data frequency used in this experiment
+FREQUENCY: str = "1h"  # "D" for daily, "1h" for hourly, etc.
+
 
 # ============================
 # 2. DATE RANGES
 # ============================
 
-# You can adjust these for your final thesis experiments
-TRAIN_START_DATE = "2014-01-01"
-TRAIN_END_DATE = "2019-12-31"
+# For Experiment 6 the range was adjusted as the earliest available hourly data is from 2018
+# Adjust these if your BTCUSD_hourly.csv covers a different period.
+TRAIN_START_DATE = "2018-05-15"   # first available hourly bar
+TRAIN_END_DATE   = "2023-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear, 2023 chop
 
-VAL_START_DATE = "2020-01-01"
-VAL_END_DATE = "2020-12-31"
+VAL_START_DATE   = "2024-01-01"   # recent but separate for tuning / threshold selection
+VAL_END_DATE     = "2024-12-31"
 
-TEST_START_DATE = "2021-01-01"
-TEST_END_DATE = "2024-12-31"
+TEST_START_DATE  = "2025-01-01"   # most recent, fully out-of-sample regime
+TEST_END_DATE    = "2025-12-31"   # or last available 2025 timestamp
 
 
 # ============================
 # 3. FEATURES, LABELS & TASK
 # ============================
 
-# === Experiment 3: 3-class 1-day-ahead direction label configuration ===
+# === Experiment 6: 3-class 24-hour-ahead direction label configuration (hourly data) ===
 #
-# We create a column (in data_pipeline.add_target_column) with:
-#   0 = DOWN  (return < -DIRECTION_THRESHOLD)
-#   1 = FLAT  (|return| <= DIRECTION_THRESHOLD)
-#   2 = UP    (return >  DIRECTION_THRESHOLD)
-# for the 1-day ahead return.
+# We keep the same label name for now ("direction_3c") so the rest of the pipeline
+# continues to work. In data_pipeline.add_target_column(), we will redefine it to mean:
+#   0 = DOWN  (H-step return < -DIRECTION_THRESHOLD)
+#   1 = FLAT  (|H-step return| <= DIRECTION_THRESHOLD)
+#   2 = UP    (H-step return >  DIRECTION_THRESHOLD)
+# where H = FORECAST_HORIZONS[0] is now measured in *hourly steps* (e.g. 24).
 TRIPLE_DIRECTION_COLUMN: str = "direction_3c"
 
 # Number of classes for the direction classification task
 NUM_CLASSES: int = 3
 
 # Symmetric threshold around zero for deciding DOWN / FLAT / UP.
-# When USE_LOG_RETURNS = True this is applied to the 1-day *log* return
-# log(close_{t+1} / close_t); for small moves it is still ~equal to a % move.
-# Example: 0.003 ≈ 0.3% absolute daily move.
+# When USE_LOG_RETURNS = True this is applied to the H-step *log* return
+# log(close_{t+H} / close_t); for small moves it is still ~equal to a % move.
+# Example: 0.003 ≈ 0.3% absolute move over the horizon.
 DIRECTION_THRESHOLD: float = 0.005
 
 # Whether to construct forward returns as log returns instead of simple
-# percentage returns when building future_return_*d and the direction_3c label.
-# True  -> use log(close_{t+1} / close_t)
-# False -> use close_{t+1} / close_t - 1.0
+# percentage returns when building future_return_* and the direction_3c label.
+# True  -> use log(close_{t+H} / close_t)
+# False -> use close_{t+H} / close_t - 1.0
 USE_LOG_RETURNS: bool = True
 
 
 # -------- Task-level configuration --------
 #
-# Experiment 3: 1-day-ahead 3-class direction classification based on direction_3c.
+# Experiment 6: H-step-ahead 3-class direction classification based on direction_3c.
 TASK_TYPE: str = "classification"
 TARGET_COLUMN: str = TRIPLE_DIRECTION_COLUMN
 DIRECTION_LABEL_COLUMN: str = TRIPLE_DIRECTION_COLUMN
 
-# Sequence length (number of past days the model sees)
-SEQ_LENGTH = 30  # 30 days of history
+# Sequence length (number of past time steps the model sees).
+# For hourly data: 96 = 4 days of history.
+SEQ_LENGTH = 96  # 96 hourly bars of history (~4 days)
 
 # -------- Multi-horizon forecasting configuration --------
 #
-# We keep a general FORECAST_HORIZONS list so we can easily switch to
-# multi-horizon experiments later. For Experiment 3, we focus on a
-# single 1-day horizon.
-FORECAST_HORIZONS: List[int] = [1]
+# FORECAST_HORIZONS is now interpreted in *time steps*.
+# For hourly data with FORECAST_HORIZONS = [24],
+# this means "next 24 hours" as the prediction horizon.
+FORECAST_HORIZONS: List[int] = [24]
 
 # Convenience flag: True if we are in a genuine multi-horizon setup.
 USE_MULTI_HORIZON: bool = len(FORECAST_HORIZONS) > 1
@@ -142,47 +156,45 @@ SENTIMENT_COLS: List[str] = [
 ]
 
 # -------- Calendar & halving features (base + future) --------
-# Base (per-day) calendar features – attached to each date t.
+# Base calendar features – attached to each timestamp t.
+# For hourly data, hour_of_day captures intraday patterns (0–23).
 CALENDAR_COLS: List[str] = [
-    "day_of_week",   # 0=Monday, ..., 6=Sunday  (for day t)
-    "is_weekend",    # 1 if Saturday/Sunday, else 0 (for day t)
-    "month",         # 1–12 (for day t)
+    "day_of_week",   # 0=Monday, ..., 6=Sunday  (for t)
+    "is_weekend",    # 1 if Saturday/Sunday, else 0 (for t)
+    "month",         # 1–12 (for t)
+    "hour_of_day",   # 0–23 (for t, important for intraday data)
 ]
 
-# Base halving-related features – attached to each date t.
-# These are computed from known / approximate halving dates.
+# Base halving-related features – attached to each timestamp t.
 HALVING_COLS: List[str] = [
     "is_halving_window",     # 1 if within ±N days of a halving, else 0
     "days_to_next_halving",  # integer days from t to the next halving
 ]
 
-# Future (t+1) versions that the model will use as known future covariates.
-# We create these from the base columns using shift(-1) in data_pipeline.py.
+# Future (t+H) versions that the model will use as known future covariates.
+# For hourly data, this includes the hour of day at the horizon endpoint,
+# which is fully known in advance (calendar structure).
 FUTURE_CALENDAR_COLS: List[str] = [
-    "dow_next",           # day_of_week for t+1
-    "is_weekend_next",    # is_weekend for t+1
-    "month_next",         # month for t+1
+    "dow_next",           # day_of_week for t+H
+    "is_weekend_next",    # is_weekend for t+H
+    "month_next",         # month for t+H
+    "hour_next",          # hour_of_day for t+H
 ]
 
 FUTURE_HALVING_COLS: List[str] = [
-    "is_halving_window_next",  # halving-window flag for t+1
-    # You could also add "days_to_next_halving_next" if you want it later.
+    "is_halving_window_next",  # halving-window flag for t+H
 ]
 
-# All known future covariates (for now: calendar + halving for t+1).
+# All known future covariates (for now: calendar + halving for t+H).
 FUTURE_COVARIATE_COLS: List[str] = FUTURE_CALENDAR_COLS + FUTURE_HALVING_COLS
 
 # -------- Advanced TFT-style feature grouping --------
-# In the original TFT, inputs are split into:
-#   - static covariates       (do not change over time)
-#   - past time-varying       (observed up to "now")
-#   - known future covariates (known into the future, e.g. calendar features)
 
 # For now, we treat all existing FEATURE_COLS as past time-varying covariates.
 PAST_COVARIATE_COLS: List[str] = FEATURE_COLS.copy()
 
 # FUTURE_COVARIATE_COLS is defined above and already used in data_pipeline.py
-# to build per-sample future covariate vectors for t+1.
+# to build per-sample future covariate vectors for t+H.
 
 # Static covariates (e.g. asset ID, regime label) – not used yet for single BTC.
 STATIC_COLS: List[str] = []
@@ -204,7 +216,7 @@ class ModelConfig:
     - LSTM encoder over the past sequence
     - multi-head self-attention over the encoded sequence
     - temporal feed-forward / gating blocks (GRNs with GLU)
-    - optional known future covariate encoder (calendar + halving for t+1)
+    - optional known future covariate encoder (calendar + halving for t+H)
     - final linear layer that outputs one or more values per sample:
         * classification: logits
         * regression:     predicted return(s) for one or more horizons
@@ -236,7 +248,7 @@ class ModelConfig:
     # Use Variable Selection Networks over past covariates.
     use_variable_selection: bool = True
 
-    # Use known future covariates (e.g. calendar & halving info for t+1).
+    # Use known future covariates (e.g. calendar & halving info for t+H).
     use_future_covariates: bool = True
 
     # Hidden size used inside variable selection networks (VSNs) and GRNs.
@@ -245,21 +257,21 @@ class ModelConfig:
     # Hidden size for potential static covariate encoders (multi-asset extension).
     static_hidden_size: int = 16
 
-    # Number of future-covariate features for t+1.
+    # Number of future-covariate features for t+H.
     # Computed from FUTURE_COVARIATE_COLS; currently 4.
     future_input_size: int = len(FUTURE_COVARIATE_COLS)
 
     # Placeholder for future extension with static covariates
     use_static_covariates: bool = False
 
-    # Forecast horizons in days (e.g. [1] for Exp.3, later maybe [1, 3, 7]).
+    # Forecast horizons in time steps (e.g. [24] for next 24 hours at 1h frequency).
     forecast_horizons: List[int] = field(
         default_factory=lambda: FORECAST_HORIZONS
     )
 
     # Output dimension: one value per forecast horizon for regression,
     # or logits if you extend classification to multi-horizon later.
-    # For Experiment 3 (classification), this will be overridden to NUM_CLASSES.
+    # For Experiment 6 (classification), this will be overridden to NUM_CLASSES.
     output_size: int = len(FORECAST_HORIZONS)
 
 
@@ -267,7 +279,7 @@ MODEL_CONFIG = ModelConfig()
 
 # Make sure the final layer has the right size for the active task
 if TASK_TYPE == "classification":
-    # 3-class UP / FLAT / DOWN for the 1-day-ahead direction.
+    # 3-class UP / FLAT / DOWN for the H-step-ahead direction.
     MODEL_CONFIG.output_size = NUM_CLASSES
 
 
@@ -294,9 +306,11 @@ class TrainingConfig:
     # Seed for reproducibility (torch, numpy, etc.)
     seed: int = 42
 
+    # Gradient clipping (by norm)
+    grad_clip: float = 1.0
+
     # Initial classification threshold (used as a default / fallback).
     # Final threshold for UP-vs-REST is tuned in evaluate_tft.py.
-    grad_clip: float = 1.0
     threshold: float = 0.55
 
 
@@ -340,15 +354,16 @@ THRESHOLD_SEARCH_STEPS: int = 17  # e.g. 0.10, 0.15, ..., 0.90
 THRESHOLD_TARGET_METRIC: str = "f1"
 
 # ----------------------------
-# Experiment 5c: UP-vs-REST threshold grid
+# Experiment 5c-style: UP-vs-REST threshold grid
 # ----------------------------
-# For Experiment 5c we also define an explicit grid of P(UP) thresholds
-# and a selection metric for choosing τ* on the validation set.
-# These will be used inside evaluate_tft.py instead of the dense linspace
-# search above, to make the operating points more interpretable.
 UP_THRESHOLD_GRID: List[float] = [0.10, 0.20, 0.30, 0.40, 0.50]
 
 # Metric to use when selecting τ* from UP_THRESHOLD_GRID on the validation set.
-# We use "balanced_accuracy" to penalize always-UP behaviour and give equal
-# weight to correctly identifying UP and correctly rejecting NOT_UP.
 THRESHOLD_SELECTION_METRIC: str = "balanced_accuracy"
+
+# ----------------------------
+# Trading / evaluation options
+# ----------------------------
+# For hourly data with H>1 (e.g. 24h horizon), use non-overlapping trades
+# when computing trading metrics (one trade per H-step block).
+NON_OVERLAPPING_TRADES: bool = True

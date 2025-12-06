@@ -6,16 +6,17 @@ logits or outputs for the configured task.
 
 Current architecture (with optional VSNs, gating and known future inputs):
 
-1. Variable Selection Network (optional) or linear projection from raw
+1. Variable Selection Network (VSN) or linear projection from raw
    input features to a shared hidden size.
 2. LSTM encoder over the past time steps.
 3. Multi-head self-attention over the encoded sequence.
 4. Temporal feed-forward / gating block (Gated Residual Networks or
    residual MLP).
-5. Optional future covariate encoder (calendar + halving info for t+1).
+5. Optional future covariate encoder (calendar + halving info for t+H,
+   where H is the main forecast horizon).
 
-In Experiment 3, the model is configured for:
-    - 1-day-ahead 3-class direction classification (0=DOWN, 1=FLAT, 2=UP)
+In Experiment 6, the model is configured for:
+    - H-step-ahead 3-class direction classification (0=DOWN, 1=FLAT, 2=UP)
     - output_size = NUM_CLASSES (from config)
 
 For future experiments, you can change config.FORECAST_HORIZONS and
@@ -27,7 +28,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from experiment_5 import config
+from experiment_6 import config
 
 
 # ============================
@@ -253,14 +254,15 @@ class TemporalFusionTransformer(nn.Module):
             Past covariates (OHLCV + indicators) as built in data_pipeline.py.
         x_future:
             Optional tensor of shape (batch_size, future_input_size)
-            Known future covariates for t+1 (calendar + halving), as built
-            in data_pipeline.py. If config.MODEL_CONFIG.use_future_covariates
-            is True, x_future must be provided.
+            Known future covariates for t+H (calendar + halving), where
+            H = config.FORECAST_HORIZONS[0]. If
+            config.MODEL_CONFIG.use_future_covariates is True, x_future
+            must be provided.
 
-    Output (Experiment 3 configuration):
+    Output (Experiment 6 configuration):
         outputs:
             Tensor of shape (batch_size, NUM_CLASSES)
-            3-class logits for 1-day-ahead direction:
+            3-class logits for H-step-ahead direction:
                 0 = DOWN, 1 = FLAT, 2 = UP
 
     If return_attention=True, the forward pass also returns the attention
@@ -418,7 +420,7 @@ class TemporalFusionTransformer(nn.Module):
         # We aggregate over time (last time step), optionally fuse
         # with future covariates, and map hidden_size → output_size.
         #
-        # In Experiment 3:
+        # In this classification setup:
         #   - TASK_TYPE = "classification"
         #   - MODEL_CONFIG.output_size = NUM_CLASSES (3)
         self.output_layer = nn.Linear(hidden_size, self.config.output_size)
@@ -435,9 +437,8 @@ class TemporalFusionTransformer(nn.Module):
         Args:
             x_past:
                 Past covariates, tensor of shape (batch_size, seq_length, input_size).
-                This should match the sequences created in data_pipeline.py.
             x_future:
-                Future covariates for t+1, tensor of shape
+                Future covariates for t+H, tensor of shape
                 (batch_size, future_input_size). If
                 config.MODEL_CONFIG.use_future_covariates is True, this must
                 be provided. If the flag is False, x_future is ignored.
@@ -448,7 +449,7 @@ class TemporalFusionTransformer(nn.Module):
         Returns:
             outputs:
                 Tensor of shape (batch_size, output_size).
-                In Experiment 3 this is (B, 3) logits.
+                In this single-horizon classification setup, this is (B, 3) logits (DOWN/FLAT/UP).
             attn_weights (optional):
                 Tensor of shape (batch_size, seq_length, seq_length) with
                 attention weights over time. Only returned if
@@ -567,7 +568,7 @@ class TemporalFusionTransformer(nn.Module):
 
         # ---- Step 7: Final output layer ----
         # Map to final outputs: (B, output_size)
-        #   - Experiment 3: (B, 3) logits for 1-day direction.
+        #   - Experiment: (B, 3) logits for 1-day direction.
         #   - Future: regression or multi-horizon if you reconfigure config.
         outputs = self.output_layer(fusion_output)
 

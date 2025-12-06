@@ -3,14 +3,16 @@ train_tft.py
 
 Training script for the Temporal Fusion Transformer (TFT) on BTC data.
 
-Experiment 3 / 5 baseline:
-  - 1-day-ahead 3-class direction classification:
+Experiment 6 configuration:
+  - 1-hour BTC candles (config.FREQUENCY = "1h")
+  - H-step-ahead 3-class direction classification, where
         0 = DOWN, 1 = FLAT, 2 = UP
+    and H = config.FORECAST_HORIZONS[0] (e.g. 24 hours ahead).
   - Target column is config.TRIPLE_DIRECTION_COLUMN ("direction_3c"),
-    created from the 1-day forward return using config.DIRECTION_THRESHOLD.
+    created from the H-step forward return using config.DIRECTION_THRESHOLD.
   - Forward return can be:
-        * log(close_{t+1} / close_t)      if config.USE_LOG_RETURNS = True
-        * close_{t+1} / close_t - 1.0     otherwise
+        * log(close_{t+H} / close_t)      if config.USE_LOG_RETURNS = True
+        * close_{t+H} / close_t - 1.0     otherwise
     (see data_pipeline.add_target_column).
 
 Currently, only the multi-class classification path is implemented:
@@ -28,13 +30,12 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from typing import Dict, Tuple, Optional
 
 import torch
 from torch.utils.data import DataLoader
 
-from experiment_5.config import (
+from experiment_6.config import (
     MODEL_CONFIG,
     TRAINING_CONFIG,
     MODELS_DIR,
@@ -46,15 +47,19 @@ from experiment_5.config import (
     USE_LOG_RETURNS,
     DIRECTION_THRESHOLD,
     DIRECTION_LABEL_COLUMN,
+    FORECAST_HORIZONS,
+    FREQUENCY,
+    BEST_MODEL_PATH,
 )
-from experiment_5.data_pipeline import prepare_datasets
-from experiment_5.tft_model import TemporalFusionTransformer
-from experiment_5 import utils
+from experiment_6.data_pipeline import prepare_datasets
+from experiment_6.tft_model import TemporalFusionTransformer
+from experiment_6 import utils
 
 
 # ============================================================
 # 1. DATALOADER CREATION
 # ============================================================
+
 
 def create_dataloaders(
     train_dataset,
@@ -85,6 +90,7 @@ def create_dataloaders(
 # 2. SINGLE-EPOCH TRAINING / EVAL
 # ============================================================
 
+
 def run_epoch(
     model: torch.nn.Module,
     data_loader: DataLoader,
@@ -113,58 +119,56 @@ def run_epoch(
             If True, run in training mode and update weights.
             If False, run in eval mode and do not update weights.
         threshold:
-            Currently unused in this Experiment 3/5 implementation
-            (metrics are computed from full class probabilities), but
-            kept for future binary / UP-vs-REST extensions.
+            Currently unused for multi-class, kept for future UP-vs-REST or
+            binary tasks (so the signature is stable).
 
     Returns:
-        A dictionary of metrics. Always includes:
-            - "loss"
-        Additionally for classification:
-            - "accuracy", "precision", "recall", "f1", "auc"
+        Dict of metrics, always including a "loss" key. For classification,
+        this also contains:
+            "accuracy", "precision", "recall", "f1", "auc"
     """
     if train:
-        if optimizer is None:
-            raise ValueError("Optimizer must be provided when train=True.")
         model.train()
     else:
         model.eval()
 
     total_loss = 0.0
-    all_true: list[torch.Tensor] = []
-    all_outputs: list[torch.Tensor] = []
+    num_samples = 0
 
-    num_samples = len(data_loader.dataset)
+    all_true = []
+    all_outputs = []
 
     for batch in data_loader:
-        # Unpack batch: supports both (x_past, y) and (x_past, x_future, y)
+        # Unpack batch: either (X_past, y) or (X_past, X_future, y)
         if len(batch) == 2:
             x_past, y = batch
             x_future = None
-        else:
+        elif len(batch) == 3:
             x_past, x_future, y = batch
+        else:
+            raise ValueError(
+                f"Expected batch of length 2 or 3, got {len(batch)}. "
+                "Check BTCTFTDataset.__getitem__."
+            )
 
         x_past = x_past.to(device)
         y = y.to(device)
+
         if x_future is not None:
             x_future = x_future.to(device)
 
         with torch.set_grad_enabled(train):
-            # Forward pass
-            outputs = model(x_past) if x_future is None else model(x_past, x_future)
-
+            # Forward
             if TASK_TYPE == "classification":
-                # Multi-class classification:
-                # outputs: (B, NUM_CLASSES) logits
-                # y:       (B,) integer labels in {0,1,2}
-                logits = outputs
-                y_flat = y.view(-1).long()
+                # logits shape: (batch_size, NUM_CLASSES)
+                if x_future is not None:
+                    logits = model(x_past, x_future)
+                else:
+                    logits = model(x_past)
 
-                loss = criterion(logits, y_flat)
-
-                y_for_metrics = y_flat
+                loss = criterion(logits, y)
                 out_for_metrics = logits
-
+                y_for_metrics = y
             else:
                 raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
 
@@ -182,6 +186,7 @@ def run_epoch(
         # Accumulate loss and predictions
         batch_size = y.size(0)  # number of samples in batch
         total_loss += loss.item() * batch_size
+        num_samples += batch_size
 
         all_true.append(y_for_metrics.detach().cpu())
         all_outputs.append(out_for_metrics.detach().cpu())
@@ -205,7 +210,6 @@ def run_epoch(
             y_prob=y_prob,
         )
         metrics["loss"] = float(avg_loss)
-
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
 
@@ -216,6 +220,7 @@ def run_epoch(
 # 3. MAIN TRAINING LOOP
 # ============================================================
 
+
 def main() -> None:
     utils.set_seed(TRAINING_CONFIG.seed)
     device = utils.get_device()
@@ -225,13 +230,28 @@ def main() -> None:
     os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
     os.makedirs(PLOTS_DIR, exist_ok=True)
 
+    # Derive a human-readable horizon description
+    if FORECAST_HORIZONS:
+        horizon_steps = FORECAST_HORIZONS[0]
+    else:
+        horizon_steps = 1
+
+    if FREQUENCY.upper() == "D":
+        horizon_desc = f"{horizon_steps}-day-ahead"
+    elif FREQUENCY.lower() in {"1h", "h"}:
+        horizon_desc = f"{horizon_steps}-hour-ahead"
+    else:
+        horizon_desc = f"{horizon_steps}-step-ahead"
+
     # Print a short experiment summary so logs are self-documenting
     print(
-        "[train_tft] Experiment setup: 1-day-ahead 3-class direction "
+        f"[train_tft] Experiment setup: {horizon_desc} "
+        f"{NUM_CLASSES}-class direction "
         f"label='{DIRECTION_LABEL_COLUMN}', "
         f"threshold={DIRECTION_THRESHOLD:.4f}, "
         f"use_log_returns={USE_LOG_RETURNS}, "
-        f"seq_length={SEQ_LENGTH}"
+        f"seq_length={SEQ_LENGTH}, "
+        f"frequency='{FREQUENCY}'"
     )
 
     # 1) Prepare datasets (explicitly pass SEQ_LENGTH to keep training/eval aligned)
@@ -260,7 +280,10 @@ def main() -> None:
         # Multi-class (0=DOWN, 1=FLAT, 2=UP)
         # You can later add class weights here if needed.
         criterion = torch.nn.CrossEntropyLoss()
-        print(f"[train_tft] Using CrossEntropyLoss for {NUM_CLASSES}-class classification.")
+        print(
+            f"[train_tft] Using CrossEntropyLoss for "
+            f"{NUM_CLASSES}-class classification."
+        )
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
@@ -307,7 +330,8 @@ def main() -> None:
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
-    best_model_path = os.path.join(MODELS_DIR, "tft_btc_best.pth")
+    # Path where the best model checkpoint will be saved
+    best_model_path = BEST_MODEL_PATH
 
     # Run ID for saving history/plots
     run_id = f"tft_run_{utils.get_timestamp()}"
@@ -381,7 +405,10 @@ def main() -> None:
                 f"to {best_model_path}"
             )
 
-    print(f"[train_tft] Training finished. Best Val {selection_metric_name.upper()}: {best_val_metric:.4f}")
+    print(
+        f"[train_tft] Training finished. "
+        f"Best Val {selection_metric_name.upper()}: {best_val_metric:.4f}"
+    )
 
     # Save history as JSON
     history_path = os.path.join(EXPERIMENTS_DIR, f"{run_id}_history.json")

@@ -343,6 +343,40 @@ def compute_trading_metrics(
         "avg_return_in_position": avg_in_position,
     }
 
+def select_non_overlapping_trades(
+    returns: Any,
+    scores: Any,
+    horizon: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Downsample (returns, scores) to non-overlapping H-step trades.
+
+    For example, with hourly data and H=24:
+        - original arrays have length N (one per hour)
+        - we keep indices 0, 24, 48, ... so each kept point corresponds
+          to a distinct 24-hour forward-return trade.
+
+    Args:
+        returns: 1D array-like of H-step forward returns (aligned per sample).
+        scores:  1D array-like of scores/probabilities for P(UP) at each sample.
+        horizon: H, the forecast horizon in steps (e.g. 24 for 24h-ahead).
+
+    Returns:
+        (returns_sel, scores_sel) of equal length, using indices [0, H, 2H, ...].
+    """
+    r = _to_numpy_1d(returns)
+    s = _to_numpy_1d(scores)
+
+    if r.shape != s.shape:
+        raise ValueError(
+            f"returns and scores must have same shape, got {r.shape} vs {s.shape}"
+        )
+
+    if horizon <= 0:
+        raise ValueError(f"horizon must be positive, got {horizon}")
+
+    idx = np.arange(0, r.shape[0], horizon)
+    return r[idx], s[idx]
 
 
 # ============================================================

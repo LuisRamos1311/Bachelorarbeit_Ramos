@@ -3,14 +3,20 @@ evaluate_tft.py
 
 Evaluate a trained Temporal Fusion Transformer (TFT) model on the BTC dataset.
 
-Experiment 5c setup:
+Experiment 6 / generic single-horizon setup:
     - TASK_TYPE = "classification"  (3-class DOWN / FLAT / UP via direction_3c)
-    - 1-day-ahead prediction (single-horizon)
+    - Single-horizon H-step-ahead prediction where
+          H = FORECAST_HORIZONS[0]
+      e.g. for Experiment 6 with hourly data:
+          FREQUENCY = "1h", FORECAST_HORIZONS = [24]
+          -> "next 24 hours" direction.
+
     - UP-vs-REST analysis with:
         * Manual threshold sweep over a fixed grid for P(UP)
         * Selection of τ* on validation using THRESHOLD_SELECTION_METRIC
           (e.g. balanced_accuracy)
-        * Simple long-only trading metrics based on 1-day forward returns
+        * Long-only trading metrics based on the H-step forward return
+          aligned with each sample.
 
 Behaviour:
     * Computes full multi-class metrics on val/test.
@@ -32,7 +38,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from experiment_5.config import (
+from experiment_6.config import (
     MODEL_CONFIG,
     TRAINING_CONFIG,
     TASK_TYPE,
@@ -48,16 +54,16 @@ from experiment_5.config import (
     DIRECTION_THRESHOLD,
     FORECAST_HORIZONS,
     USE_MULTI_HORIZON,
-    # Experiment 5c: threshold grid + selection metric
+    FREQUENCY,
+    # UP-vs-REST threshold grid + selection metric
     UP_THRESHOLD_GRID,
     THRESHOLD_SELECTION_METRIC,
+    NON_OVERLAPPING_TRADES,
 )
 
-from experiment_5.data_pipeline import prepare_datasets
-# Assumes return_forward_returns=True is supported and returns
-# a dict with keys "train", "val", "test", "full" for future_return_1d
-from experiment_5.tft_model import TemporalFusionTransformer
-from experiment_5 import utils
+from experiment_6.data_pipeline import prepare_datasets
+from experiment_6.tft_model import TemporalFusionTransformer
+from experiment_6 import utils
 
 
 # ---------------------------------------------------------------------------
@@ -120,44 +126,41 @@ def run_inference_classification(
     criterion: nn.Module,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
-    Run inference for the 3-class classification task.
-
-    Returns:
-        y_true : array of true integer labels, shape (N,)
-        y_prob : array of predicted class probabilities, shape (N, C)
-        avg_loss : average CrossEntropy loss over the dataset
+    Run inference for multi-class classification and return:
+        y_true (N,), y_prob (N, C), avg_loss (scalar)
     """
     model.eval()
-    all_true: list[torch.Tensor] = []
-    all_prob: list[torch.Tensor] = []
     total_loss = 0.0
     total_count = 0
+
+    all_true: List[torch.Tensor] = []
+    all_prob: List[torch.Tensor] = []
 
     with torch.no_grad():
         for batch in data_loader:
             x_past, x_future, y = _unpack_batch(batch, device)
 
-            # Forward pass -> logits, shape (B, NUM_CLASSES)
-            logits = model(x_past) if x_future is None else model(x_past, x_future)
+            if x_future is not None:
+                logits = model(x_past, x_future)
+            else:
+                logits = model(x_past)
 
-            # Targets are already (B,) int64 in the dataset
-            y_flat = y.view(-1).long()
-
-            # CE expects (B, C) logits and (B,) labels
-            loss = criterion(logits, y_flat)
-            batch_size = y_flat.size(0)
+            loss = criterion(logits, y)
+            batch_size = y.size(0)
             total_loss += loss.item() * batch_size
             total_count += batch_size
 
-            # Convert logits -> probabilities
             probs = torch.softmax(logits, dim=1)
 
-            all_true.append(y_flat.cpu())
-            all_prob.append(probs.cpu())
+            all_true.append(y.detach().cpu())
+            all_prob.append(probs.detach().cpu())
 
-    y_true = torch.cat(all_true, dim=0).numpy()  # (N,)
-    y_prob = torch.cat(all_prob, dim=0).numpy()  # (N, C)
-    avg_loss = total_loss / max(1, total_count)
+    if total_count == 0:
+        raise RuntimeError("DataLoader is empty in run_inference_classification.")
+
+    y_true = torch.cat(all_true, dim=0).numpy()
+    y_prob = torch.cat(all_prob, dim=0).numpy()
+    avg_loss = total_loss / float(total_count)
 
     return y_true, y_prob, avg_loss
 
@@ -171,12 +174,28 @@ def main() -> None:
     device = utils.get_device()
     print(device)
 
+    # Horizon description (mirrors train_tft.py)
+    if FORECAST_HORIZONS:
+        horizon_steps = int(FORECAST_HORIZONS[0])
+    else:
+        horizon_steps = 1
+
+    if FREQUENCY.upper() == "D":
+        horizon_desc = f"{horizon_steps}-day-ahead"
+    elif FREQUENCY.lower() in {"1h", "h", "hourly"}:
+        horizon_desc = f"{horizon_steps}-hour-ahead"
+    else:
+        horizon_desc = f"{horizon_steps}-step-ahead"
+
     # Show key labeling configuration so you can see at a glance
     print("[evaluate_tft] Label config:")
     print(f"  USE_LOG_RETURNS     = {USE_LOG_RETURNS}")
     print(f"  DIRECTION_THRESHOLD = {DIRECTION_THRESHOLD}")
-    print(f"  FORECAST_HORIZONS   = {FORECAST_HORIZONS}")
+    print(f"  FORECAST_HORIZONS   = {FORECAST_HORIZONS} "
+          f"(first horizon: {horizon_desc})")
     print(f"  USE_MULTI_HORIZON   = {USE_MULTI_HORIZON}")
+    print(f"  FREQUENCY           = '{FREQUENCY}'")
+    print(f"  NON_OVERLAPPING_TRADES = {NON_OVERLAPPING_TRADES}")
 
     # ------------------------------------------------------------------
     # 1. Prepare datasets & loaders
@@ -235,8 +254,10 @@ def main() -> None:
         # 3-class direction classification: DOWN / FLAT / UP
         criterion = nn.CrossEntropyLoss()
 
-        print("[evaluate_tft] TASK_TYPE='classification' -> 3-class direction "
-              "(0=DOWN, 1=FLAT, 2=UP).")
+        print(
+            "[evaluate_tft] TASK_TYPE='classification' -> 3-class direction "
+            "(0=DOWN, 1=FLAT, 2=UP)."
+        )
 
         # === Validation set: multi-class metrics ===
         print("[evaluate_tft] Running inference on validation set (multi-class).")
@@ -283,6 +304,37 @@ def main() -> None:
         y_val_up_prob = y_val_prob[:, up_class_index]
         y_test_up_prob = y_test_prob[:, up_class_index]
 
+        # For trading metrics we *optionally* switch to non-overlapping trades:
+        # we sub-sample returns & scores every H = horizon_steps steps.
+        # Classification metrics still use the full series (no sub-sampling).
+        if NON_OVERLAPPING_TRADES and horizon_steps > 1:
+            print(
+                "[evaluate_tft] Using non-overlapping trades for trading metrics "
+                f"(horizon_steps={horizon_steps})."
+            )
+            (
+                val_forward_returns_tr,
+                y_val_up_prob_tr,
+            ) = utils.select_non_overlapping_trades(
+                returns=val_forward_returns,
+                scores=y_val_up_prob,
+                horizon=horizon_steps,
+            )
+            (
+                test_forward_returns_tr,
+                y_test_up_prob_tr,
+            ) = utils.select_non_overlapping_trades(
+                returns=test_forward_returns,
+                scores=y_test_up_prob,
+                horizon=horizon_steps,
+            )
+        else:
+            # Fallback: original overlapping-trades behaviour
+            val_forward_returns_tr = val_forward_returns
+            test_forward_returns_tr = test_forward_returns
+            y_val_up_prob_tr = y_val_up_prob
+            y_test_up_prob_tr = y_test_up_prob
+
         # Threshold grid (fallback to EVAL_THRESHOLD if grid is empty)
         threshold_grid: List[float] = list(UP_THRESHOLD_GRID) or [float(EVAL_THRESHOLD)]
 
@@ -302,155 +354,125 @@ def main() -> None:
         best_val_trading: Dict[str, float] | None = None
         best_test_trading: Dict[str, float] | None = None
 
-        for th in threshold_grid:
-            th_float = float(th)
+        # Sweep over grid
+        for thr in threshold_grid:
+            thr = float(thr)
 
-            # Binary classification metrics on val/test
-            val_bin = utils.compute_classification_metrics(
+            # Binary classification metrics on *full* series (UP vs REST)
+            val_bin_metrics = utils.compute_classification_metrics(
                 y_true=y_val_up_true,
                 y_prob=y_val_up_prob,
-                threshold=th_float,
+                threshold=thr,
             )
-            test_bin = utils.compute_classification_metrics(
+            test_bin_metrics = utils.compute_classification_metrics(
                 y_true=y_test_up_true,
                 y_prob=y_test_up_prob,
-                threshold=th_float,
+                threshold=thr,
             )
 
-            # Long-only strategy: long BTC on days with P(UP) >= τ
-            val_positions = utils.positions_from_threshold(
-                y_prob_up=y_val_up_prob,
-                threshold=th_float,
-            )
-            test_positions = utils.positions_from_threshold(
-                y_prob_up=y_test_up_prob,
-                threshold=th_float,
-            )
-
+            # Long-only trading metrics for this threshold
+            # (possibly on non-overlapping trades)
             val_trading = utils.compute_trading_metrics(
-                returns=val_forward_returns,
-                positions=val_positions,
+                returns=val_forward_returns_tr,
+                positions=utils.positions_from_threshold(
+                    y_prob_up=y_val_up_prob_tr,
+                    threshold=thr,
+                ),
             )
             test_trading = utils.compute_trading_metrics(
-                returns=test_forward_returns,
-                positions=test_positions,
+                returns=test_forward_returns_tr,
+                positions=utils.positions_from_threshold(
+                    y_prob_up=y_test_up_prob_tr,
+                    threshold=thr,
+                ),
             )
 
+            # Score used to select τ* on validation
+            val_score = val_bin_metrics.get(selection_key, np.nan)
+
             record = {
-                "threshold": th_float,
-                "val_binary": val_bin,
-                "test_binary": test_bin,
+                "threshold": thr,
+                "val_binary": val_bin_metrics,
+                "test_binary": test_bin_metrics,
                 "val_trading": val_trading,
                 "test_trading": test_trading,
+                "selection_score": float(val_score),
             }
             sweep_records.append(record)
 
-            # Selection of τ* is based on validation metrics only
-            if AUTO_TUNE_THRESHOLD:
-                if selection_key == "balanced_accuracy":
-                    score = val_bin.get("balanced_accuracy", float("nan"))
-                elif selection_key in {"macro_f1", "f1"}:
-                    # Prefer the explicit macro_f1 key if present
-                    score = val_bin.get("macro_f1", val_bin.get("f1", float("nan")))
-                else:
-                    score = val_bin.get(selection_key, float("nan"))
-
-                if not np.isnan(score) and score > best_val_score:
-                    best_val_score = score
-                    best_threshold = th_float
-                    best_val_binary = val_bin
-                    best_test_binary = test_bin
+            if AUTO_TUNE_THRESHOLD and np.isfinite(val_score):
+                if val_score > best_val_score:
+                    best_val_score = val_score
+                    best_threshold = thr
+                    best_val_binary = val_bin_metrics
+                    best_test_binary = test_bin_metrics
                     best_val_trading = val_trading
                     best_test_trading = test_trading
 
-        # Decide which threshold to report as τ*
-        if AUTO_TUNE_THRESHOLD:
-            if best_threshold is None:
-                # Fallback to EVAL_THRESHOLD if something went wrong
-                up_threshold = float(EVAL_THRESHOLD)
-                print("[evaluate_tft] WARNING: no valid threshold selected during "
-                      "sweep; falling back to EVAL_THRESHOLD="
-                      f"{up_threshold:.3f}.")
-                val_up_metrics = utils.compute_classification_metrics(
-                    y_true=y_val_up_true,
-                    y_prob=y_val_up_prob,
-                    threshold=up_threshold,
-                )
-                test_up_metrics = utils.compute_classification_metrics(
-                    y_true=y_test_up_true,
-                    y_prob=y_test_up_prob,
-                    threshold=up_threshold,
-                )
-                val_trading_best = utils.compute_trading_metrics(
-                    returns=val_forward_returns,
-                    positions=utils.positions_from_threshold(
-                        y_prob_up=y_val_up_prob,
-                        threshold=up_threshold,
-                    ),
-                )
-                test_trading_best = utils.compute_trading_metrics(
-                    returns=test_forward_returns,
-                    positions=utils.positions_from_threshold(
-                        y_prob_up=y_test_up_prob,
-                        threshold=up_threshold,
-                    ),
-                )
-            else:
-                up_threshold = float(best_threshold)
-                val_up_metrics = best_val_binary or {}
-                test_up_metrics = best_test_binary or {}
-                val_trading_best = best_val_trading or {}
-                test_trading_best = best_test_trading or {}
-
-                print("[evaluate_tft] Validation UP-vs-REST threshold sweep "
-                      f"(optimize {THRESHOLD_SELECTION_METRIC}):")
-                print(f"  Best P(UP) threshold on val: {up_threshold:.3f}")
-                print(f"  Best validation {THRESHOLD_SELECTION_METRIC}: "
-                      f"{best_val_score:.4f}")
-        else:
-            # No auto-tuning; evaluate at EVAL_THRESHOLD only
-            up_threshold = float(EVAL_THRESHOLD)
-            print("[evaluate_tft] Validation UP-vs-REST (fixed threshold):")
-            print(f"  Using P(UP) threshold: {up_threshold:.3f}")
+        # If auto-tuning is disabled or failed, fall back to EVAL_THRESHOLD
+        if not AUTO_TUNE_THRESHOLD or best_threshold is None:
+            best_threshold = float(EVAL_THRESHOLD)
+            print(
+                f"[evaluate_tft] Auto-tuning disabled or failed, "
+                f"falling back to EVAL_THRESHOLD={best_threshold:.3f}"
+            )
 
             val_up_metrics = utils.compute_classification_metrics(
                 y_true=y_val_up_true,
                 y_prob=y_val_up_prob,
-                threshold=up_threshold,
+                threshold=best_threshold,
             )
             test_up_metrics = utils.compute_classification_metrics(
                 y_true=y_test_up_true,
                 y_prob=y_test_up_prob,
-                threshold=up_threshold,
+                threshold=best_threshold,
             )
             val_trading_best = utils.compute_trading_metrics(
-                returns=val_forward_returns,
+                returns=val_forward_returns_tr,
                 positions=utils.positions_from_threshold(
-                    y_prob_up=y_val_up_prob,
-                    threshold=up_threshold,
+                    y_prob_up=y_val_up_prob_tr,
+                    threshold=best_threshold,
                 ),
             )
             test_trading_best = utils.compute_trading_metrics(
-                returns=test_forward_returns,
+                returns=test_forward_returns_tr,
                 positions=utils.positions_from_threshold(
-                    y_prob_up=y_test_up_prob,
-                    threshold=up_threshold,
+                    y_prob_up=y_test_up_prob_tr,
+                    threshold=best_threshold,
                 ),
             )
+        else:
+            print(
+                f"[evaluate_tft] Best threshold on val ({selection_key}): "
+                f"{best_threshold:.3f} with score={best_val_score:.4f}"
+            )
+            val_up_metrics = best_val_binary or {}
+            test_up_metrics = best_test_binary or {}
+            val_trading_best = best_val_trading or {}
+            test_trading_best = best_test_trading or {}
+
+        up_threshold = float(best_threshold)
 
         # Print summary metrics at τ*
-        print(f"[evaluate_tft] Validation UP-vs-REST metrics "
-              f"(τ* = {up_threshold:.3f}):")
+        print(
+            f"[evaluate_tft] Validation UP-vs-REST metrics "
+            f"(τ* = {up_threshold:.3f}):"
+        )
         for k, v in val_up_metrics.items():
             print(f"  Val {k}: {v:.4f}")
 
-        print(f"[evaluate_tft] Test UP-vs-REST metrics "
-              f"(τ* = {up_threshold:.3f}):")
+        print(
+            f"[evaluate_tft] Test UP-vs-REST metrics "
+            f"(τ* = {up_threshold:.3f}):"
+        )
         for k, v in test_up_metrics.items():
             print(f"  Test {k}: {v:.4f}")
 
         # Trading summary at τ*
-        print("[evaluate_tft] Long-only trading metrics at τ* (1-day horizon):")
+        print(
+            f"[evaluate_tft] Long-only trading metrics at τ* "
+            f"({horizon_desc} horizon):"
+        )
         print("  Validation:")
         for k, v in val_trading_best.items():
             print(f"    {k}: {v:.6f}")
@@ -530,6 +552,9 @@ def main() -> None:
                 "direction_threshold": float(DIRECTION_THRESHOLD),
                 "forecast_horizons": list(FORECAST_HORIZONS),
                 "use_multi_horizon": bool(USE_MULTI_HORIZON),
+                "frequency": FREQUENCY,
+                "horizon_steps": int(horizon_steps),
+                "non_overlapping_trades": bool(NON_OVERLAPPING_TRADES),
             },
 
             "seq_length": int(SEQ_LENGTH),
