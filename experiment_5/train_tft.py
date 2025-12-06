@@ -3,7 +3,7 @@ train_tft.py
 
 Training script for the Temporal Fusion Transformer (TFT) on BTC data.
 
-Experiment 3 + log-returns variant:
+Experiment 3 / 5 baseline:
   - 1-day-ahead 3-class direction classification:
         0 = DOWN, 1 = FLAT, 2 = UP
   - Target column is config.TRIPLE_DIRECTION_COLUMN ("direction_3c"),
@@ -16,8 +16,8 @@ Experiment 3 + log-returns variant:
 Currently, only the multi-class classification path is implemented:
   - TASK_TYPE = "classification"
   - Loss: CrossEntropyLoss on 3 classes (DOWN / FLAT / UP)
-  - Metrics: utils.compute_multiclass_metrics
-  - Model selection: best validation F1 (macro)
+  - Metrics: utils.compute_multiclass_metrics (macro-averaged)
+  - Model selection: best validation macro-F1 ("f1" from compute_multiclass_metrics)
 
 The code is written so that later you can extend it to:
   - multi-horizon regression or classification (by adding branches to
@@ -101,7 +101,7 @@ def run_epoch(
         model:
             The Temporal Fusion Transformer model.
         data_loader:
-            DataLoader yielding (X_past, X_future, y) or (X_past, y).
+            DataLoader yielding (X_past, y) or (X_past, X_future, y).
         device:
             Torch device.
         criterion:
@@ -113,7 +113,7 @@ def run_epoch(
             If True, run in training mode and update weights.
             If False, run in eval mode and do not update weights.
         threshold:
-            Currently unused in this Experiment 3 implementation
+            Currently unused in this Experiment 3/5 implementation
             (metrics are computed from full class probabilities), but
             kept for future binary / UP-vs-REST extensions.
 
@@ -277,7 +277,7 @@ def main() -> None:
     num_epochs = TRAINING_CONFIG.num_epochs
     threshold = TRAINING_CONFIG.threshold  # kept for future binary/UP-vs-REST uses
 
-    history = {
+    history: Dict[str, list] = {
         "epoch": [],
         "train_loss": [],
         "val_loss": [],
@@ -299,14 +299,18 @@ def main() -> None:
                 "val_auc": [],
             }
         )
+        # "f1" here is macro-F1 from utils.compute_multiclass_metrics
         selection_metric_name = "f1"
         best_val_metric = -1.0
         selection_mode = "max"
-        print("[train_tft] Model selection metric: Val F1 (maximize).")
+        print("[train_tft] Model selection metric: Val macro-F1 (maximize).")
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
     best_model_path = os.path.join(MODELS_DIR, "tft_btc_best.pth")
+
+    # Run ID for saving history/plots
+    run_id = f"tft_run_{utils.get_timestamp()}"
 
     print(f"[train_tft] Starting training for {num_epochs} epochs.")
 
@@ -377,19 +381,15 @@ def main() -> None:
                 f"to {best_model_path}"
             )
 
-    print(
-        f"[train_tft] Training finished. "
-        f"Best Val {selection_metric_name.upper()}: {best_val_metric:.4f}"
-    )
+    print(f"[train_tft] Training finished. Best Val {selection_metric_name.upper()}: {best_val_metric:.4f}")
 
-    # Save training history
-    run_id = time.strftime("tft_run_%Y%m%d_%H%M%S")
+    # Save history as JSON
     history_path = os.path.join(EXPERIMENTS_DIR, f"{run_id}_history.json")
-    with open(history_path, "w") as f:
+    with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
     print(f"[train_tft] History saved to {history_path}")
 
-    # Plot curves
+    # Plot training curves
     curves_path = os.path.join(PLOTS_DIR, f"{run_id}_training_curves.png")
     utils.plot_training_curves(history, curves_path)
     print(f"[train_tft] Training curves saved to {curves_path}")

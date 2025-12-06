@@ -29,6 +29,7 @@ from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix,
     roc_curve,
+    balanced_accuracy_score,
 )
 import matplotlib.pyplot as plt
 
@@ -161,12 +162,25 @@ def compute_classification_metrics(
     except ValueError:
         auc = float("nan")
 
+    # Balanced accuracy penalizes always-positive predictions and
+    # gives equal weight to correctly identifying positive and negative.
+    bal_acc = balanced_accuracy_score(y_true_arr, y_pred)
+
+    # Macro-F1: average F1 over both classes (0 and 1)
+    macro_f1 = f1_score(y_true_arr, y_pred, average="macro", zero_division=0)
+
+    # Fraction of samples predicted as positive (UP)
+    positive_rate = float(y_pred.mean())
+
     return {
         "accuracy": float(acc),
+        "balanced_accuracy": float(bal_acc),
         "precision": float(prec),
         "recall": float(rec),
         "f1": float(f1),
+        "macro_f1": float(macro_f1),
         "auc": float(auc),
+        "positive_rate": positive_rate,
     }
 
 
@@ -234,7 +248,105 @@ def compute_multiclass_metrics(
 
 
 # ============================================================
-# 4. TRAINING CURVE PLOTTING
+# 4. TRADING HELPERS
+# ============================================================
+
+def positions_from_threshold(
+    y_prob_up: Any,
+    threshold: float,
+) -> np.ndarray:
+    """
+    Convert predicted P(UP) scores into 0/1 long-only positions.
+
+    Args:
+        y_prob_up:
+            Probabilities or scores for the UP class (1D array-like).
+        threshold:
+            If P(UP) >= threshold -> position = 1 (long), else 0 (flat).
+
+    Returns:
+        1D np.ndarray of positions in {0, 1}.
+    """
+    probs = _to_numpy_1d(y_prob_up)
+    probs_clipped = np.clip(probs, 0.0, 1.0)
+    return (probs_clipped >= threshold).astype(int)
+
+
+def compute_trading_metrics(
+    returns: Any,
+    positions: Any,
+    trading_days_per_year: int = 252,
+) -> Dict[str, float]:
+    """
+    Compute simple long-only trading metrics for a given return and position series.
+
+    Args:
+        returns:
+            1D array-like of forward returns (e.g. future_return_1d).
+        positions:
+            1D array-like of {0, 1} positions. Must have same shape as returns.
+        trading_days_per_year:
+            Used for annualizing the Sharpe ratio.
+
+    Returns:
+        Dict with avg_daily_return, cumulative_return, sharpe, hit_ratio,
+        and avg_return_in_position.
+    """
+    r = _to_numpy_1d(returns)
+    p = _to_numpy_1d(positions)
+
+    if r.shape != p.shape:
+        raise ValueError(
+            f"returns and positions must have the same shape, "
+            f"got {r.shape} vs {p.shape}"
+        )
+
+    if r.size == 0:
+        return {
+            "avg_daily_return": 0.0,
+            "cumulative_return": 0.0,
+            "sharpe": 0.0,
+            "hit_ratio": 0.0,
+            "avg_return_in_position": 0.0,
+        }
+
+    # Strategy daily returns: only earn the return when in position
+    strat_r = r * p
+
+    # Average daily return of the strategy
+    avg_daily = float(strat_r.mean())
+
+    # Cumulative return over the period (product of (1 + r_t) - 1)
+    cumulative = float(np.prod(1.0 + strat_r) - 1.0)
+
+    # Sharpe ratio (simple, using sample std dev)
+    std_daily = float(strat_r.std(ddof=1))
+    if std_daily > 0.0:
+        sharpe = (avg_daily / std_daily) * np.sqrt(trading_days_per_year)
+    else:
+        sharpe = 0.0
+
+    # Hit ratio: fraction of days with positive strategy return
+    hit_ratio = float((strat_r > 0).mean())
+
+    # Average return on days where we are actually in position
+    if np.any(p == 1):
+        avg_in_position = float(strat_r[p == 1].mean())
+    else:
+        avg_in_position = 0.0
+
+    return {
+        "avg_daily_return": avg_daily,
+        "cumulative_return": cumulative,
+        "sharpe": sharpe,
+        "hit_ratio": hit_ratio,
+        "avg_return_in_position": avg_in_position,
+    }
+
+
+
+# ============================================================
+# 5. TRAINING CURVE PLOTTING
 # ============================================================
 
 def plot_training_curves(history: Dict[str, Sequence[float]], out_path: str) -> None:
@@ -313,7 +425,7 @@ def plot_training_curves(history: Dict[str, Sequence[float]], out_path: str) -> 
 
 
 # ============================================================
-# 5. CONFUSION MATRIX & ROC CURVE PLOTTING
+# 6. CONFUSION MATRIX & ROC CURVE PLOTTING
 # ============================================================
 
 def plot_confusion_matrix(
@@ -463,7 +575,7 @@ def plot_roc_curve(
 
 
 # ============================================================
-# 6. SCORE / PROBABILITY HISTOGRAM
+# 7. SCORE / PROBABILITY HISTOGRAM
 # ============================================================
 
 def plot_probability_histogram(

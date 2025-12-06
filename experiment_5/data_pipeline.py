@@ -745,7 +745,17 @@ class BTCTFTDataset(Dataset):
 def prepare_datasets(
     csv_path: str | None = None,
     seq_length: int = config.SEQ_LENGTH,
-) -> Tuple[BTCTFTDataset, BTCTFTDataset, BTCTFTDataset, Dict[str, object]]:
+    return_forward_returns: bool = False,
+) -> (
+    Tuple[BTCTFTDataset, BTCTFTDataset, BTCTFTDataset, Dict[str, object]]
+    | Tuple[
+        BTCTFTDataset,
+        BTCTFTDataset,
+        BTCTFTDataset,
+        Dict[str, object],
+        Dict[str, np.ndarray],
+    ]
+):
     """
     High-level function that runs the full data pipeline for Experiment 3.
 
@@ -774,6 +784,8 @@ def prepare_datasets(
      10. Build sliding-window sequences for past covariates and per-sample
          future covariate vectors for t+1, using the 3-class label as y.
      11. Wrap them into BTCTFTDataset objects.
+     12. (Optional) If return_forward_returns=True, also return a dict
+         with 1-day forward returns aligned to each sample in each split.
 
     Returns
     -------
@@ -790,6 +802,12 @@ def prepare_datasets(
           - "feature_cols"
           - "price_volume_cols"
           - "indicator_cols"
+    forward_returns : dict (optional, only if return_forward_returns=True)
+        {
+          "train": np.ndarray of shape (N_train,) with future_return_1d
+          "val":   np.ndarray of shape (N_val,)   with future_return_1d
+          "test":  np.ndarray of shape (N_test,)  with future_return_1d
+        }
     """
     # 1. Load
     df = load_btc_daily(csv_path)
@@ -835,6 +853,28 @@ def prepare_datasets(
         train_df, val_df, test_df, feature_cols
     )
 
+    # 9.5 Extract 1-day forward returns aligned with samples (optional)
+    # future_return_1d is NOT scaled, so we can safely read it from *_df_scaled.
+    def extract_forward_returns(df_scaled: pd.DataFrame, seq_len: int) -> np.ndarray:
+        if "future_return_1d" not in df_scaled.columns:
+            raise ValueError(
+                "Column 'future_return_1d' not found. "
+                "Make sure add_target_column() was called before scaling."
+            )
+        returns_full = df_scaled["future_return_1d"].astype(float).values
+        if len(returns_full) < seq_len:
+            raise ValueError(
+                f"Not enough rows ({len(returns_full)}) to build sequences "
+                f"of length {seq_len}."
+            )
+        # Each sequence uses rows [t-seq_len+1 ... t], so the first label/return
+        # corresponds to index t = seq_len-1.
+        return returns_full[seq_len - 1 :]
+
+    train_forward = extract_forward_returns(train_df_scaled, seq_length)
+    val_forward   = extract_forward_returns(val_df_scaled, seq_length)
+    test_forward  = extract_forward_returns(test_df_scaled, seq_length)
+
     # 10. Build sequences + future covariate vectors
     label_col = config.TARGET_COLUMN  # direction_3c (1-day 3-class label)
 
@@ -860,10 +900,31 @@ def prepare_datasets(
         label_col=label_col,
     )
 
+    # Sanity check: returns must align with number of samples
+    if (
+        train_forward.shape[0] != train_seq.shape[0]
+        or val_forward.shape[0] != val_seq.shape[0]
+        or test_forward.shape[0] != test_seq.shape[0]
+    ):
+        raise RuntimeError(
+            "Mismatch between number of sequences and forward returns. "
+            f"Train: seq={train_seq.shape[0]}, ret={train_forward.shape[0]}; "
+            f"Val: seq={val_seq.shape[0]}, ret={val_forward.shape[0]}; "
+            f"Test: seq={test_seq.shape[0]}, ret={test_forward.shape[0]}"
+        )
+
     # 11. Wrap into Datasets
     train_dataset = BTCTFTDataset(train_seq, train_labels, train_future)
     val_dataset   = BTCTFTDataset(val_seq, val_labels, val_future)
     test_dataset  = BTCTFTDataset(test_seq, test_labels, test_future)
+
+    if return_forward_returns:
+        forward_returns = {
+            "train": train_forward,
+            "val": val_forward,
+            "test": test_forward,
+        }
+        return train_dataset, val_dataset, test_dataset, scalers, forward_returns
 
     return train_dataset, val_dataset, test_dataset, scalers
 

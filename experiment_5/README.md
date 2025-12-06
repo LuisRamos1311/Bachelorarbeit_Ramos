@@ -16,7 +16,7 @@ This README is organised in three parts:
 
 1. Date-range / time-split robustness ✔️
 2. Label threshold tweaks (`DIRECTION_THRESHOLD`) ✔️
-3. Decision threshold tweaks in `evaluate_tft` (P(UP) threshold) ⏳
+3. Decision threshold tweaks in `evaluate_tft` (P(UP) threshold, Experiment 5c) ✔️
 
 ---
 
@@ -253,31 +253,158 @@ Overall, the label threshold affects class balance and interpretation more than 
 
 ---
 
-## Part 3 – Decision Threshold Tweaks in `evaluate_tft` *(planned)*
+## Part 3 – Decision Threshold Tweaks in `evaluate_tft` (Experiment 5c)
 
 ### 3.1 Goal
 
-Investigate how the **decision threshold on P(UP)** used in `evaluate_tft.py` affects:
+Parts 1–2 focused on **data splits** and **label definitions**.  
+Experiment 5c keeps the Split A baseline and the `DIRECTION_THRESHOLD = 0.005` label, but changes *how we turn P(UP) into a decision / trading signal*:
 
-- Binary **UP-vs-REST metrics** (accuracy, precision, recall, F1, AUC),  
-- And simple trading metrics (e.g. average return when in position, cumulative return, Sharpe), if added.
+- Previously (`evaluate_tft.py` in Experiments 3, 5a, 5b), the script chose the UP-vs-REST **decision threshold τ** that maximised **F1 for the UP class** on the validation set.  
+  - This consistently produced **τ ≈ 0.10**, leading to an almost “always-UP” classifier.
+- In Experiment 5c we instead:
+  1. **Sweep a small grid of thresholds** on P(UP):  
+     `UP_THRESHOLD_GRID = [0.10, 0.20, 0.30, 0.40, 0.50]`.
+  2. For each τ, compute **binary metrics** (accuracy, precision, recall, F1, AUC, *balanced accuracy*, macro-F1, positive_rate).  
+  3. Select τ\* that maximises **balanced accuracy** on the validation set, not F1 for UP.  
+  4. For each τ (and especially τ\*), evaluate a **simple long-only trading strategy**:
+     - Long BTC from *t* to *t+1* if `P(UP)_t ≥ τ`, otherwise flat.
 
-Currently, the script **chooses the threshold that maximises F1 on the validation set**, which tends to select τ ≈ 0.10 and yields a near “always-UP” classifier.
+Balanced accuracy explicitly weights **true positive rate (UP days)** and **true negative rate (NOT_UP days)** equally, so it penalises trivial “predict UP every day” behaviour.
 
-### 3.2 Planned changes
+### 3.2 Setup and Implementation
 
-- Add a **manual threshold sweep** over a grid, e.g.:
-  - `THRESHOLD_GRID = [0.1, 0.2, 0.3, 0.4, 0.5]`
-- For each τ:
-  - Compute UP-vs-REST metrics on validation and test sets.
-  - (Optionally) simulate a simple long-only strategy:
-    - Long BTC on day *t* if `P(UP) ≥ τ`, flat otherwise.
-- Save results to a JSON/CSV for easy plotting (e.g. `threshold_sweep_up_vs_rest.json`).
+All 5c runs reuse the **Split A baseline** and the TFT from Parts 1–2:
 
-### 3.3 Results (to be filled)
+- Train: **2014–2019**, Val: **2020**, Test: **2021–2024**
+- 3-class log-return label with `DIRECTION_THRESHOLD = 0.005`
+- Same TFT architecture and 20-epoch training loop
+- Best checkpoint chosen by **validation macro-F1 (3-class)**
 
-*(Placeholder for a compact table showing F1/precision/recall vs τ, and any trading metrics vs τ. Expectation: no threshold delivers consistent out-performance beyond buy-and-hold, reflecting AUC ≈ 0.5.)*
+For evaluation:
 
-### 3.4 Conclusion (to be filled)
+1. `evaluate_tft.py` runs multi-class inference on val/test and computes the usual **3-class metrics** (loss, accuracy, macro-precision/recall/F1, macro-AUC).  
+   - These numbers are identical to Split A in Part 1.
+2. It extracts **P(UP)** and converts the 3-class labels into **binary UP-vs-REST** labels.  
+3. It obtains **daily forward returns** `future_return_1d` aligned with each sample to support trading analysis.
+4. For each τ in `UP_THRESHOLD_GRID`:
 
-*(Short paragraph explaining that F1-optimal thresholds lead to trivial always-UP behaviour, and that no static decision threshold on P(UP) yields a robust directional edge. This would support the interpretation that the model’s probabilities contain very little exploitable information.)*
+   - Builds binary predictions `1{ P(UP) ≥ τ }`.  
+   - Computes binary metrics using `compute_classification_metrics`.  
+   - Constructs positions (1 = long, 0 = flat) and computes trading metrics via `compute_trading_metrics`, including:
+     - average daily return,  
+     - cumulative return,  
+     - Sharpe ratio (simple, annualised),  
+     - hit ratio (fraction of positive days when in position),  
+     - average return when in position.
+
+5. Among all τ, it selects **τ\*** that maximises **validation balanced accuracy**.  
+6. It reports binary metrics and trading metrics at τ\* and saves the full sweep to JSON for later plotting.
+
+### 3.3 Results
+
+#### 3-class metrics (unchanged from Split A baseline)
+
+On the validation and test sets, the 3-class direction performance is exactly as in Experiment 3:
+
+- **Validation (2020)**  
+  - CE loss: **1.238**  
+  - Accuracy: **0.392**  
+  - Macro-F1: **0.375**  
+  - Macro-AUC: **0.507**
+
+- **Test (2021–2024)**  
+  - CE loss: **1.292**  
+  - Accuracy: **0.411**  
+  - Macro-F1: **0.367**  
+  - Macro-AUC: **0.548**
+
+The TFT has **weak but non-zero** ability to distinguish DOWN / FLAT / UP, but no high-quality signal.
+
+---
+
+#### Threshold sweep and τ\* (UP-vs-REST)
+
+Balanced-accuracy tuning over the grid
+
+> `τ ∈ {0.10, 0.20, 0.30, 0.40, 0.50}`
+
+yields:
+
+- **Best τ\*** on validation: **0.10**  
+- **Best validation balanced accuracy** at τ\*: **0.500** (≈ random)
+
+So even when we explicitly optimise for balanced accuracy, the optimal τ\* is still **0.10**, the same as in Experiments 3/5a/5b where F1 was used. The numerical balanced accuracy score at τ\* is essentially **0.5**, i.e. no better than always predicting a single class.
+
+Binary metrics at **τ\* = 0.10**:
+
+| Split | Accuracy | Balanced Acc. | Precision | Recall (TPR) | F1 (UP) | Macro-F1 | AUC   | Positive Rate |
+|-------|----------|---------------|-----------|--------------|---------|----------|-------|---------------|
+| **Val** | 0.487  | **0.500**     | 0.487     | **0.988**    | 0.652   | 0.337    | 0.473 | **0.988**     |
+| **Test** | 0.418 | **0.507**     | 0.400     | **0.938**    | 0.561   | 0.348    | 0.496 | **0.930**     |
+
+Interpretation:
+
+- On **validation**, the model predicts UP on **98.8% of days** (positive_rate ≈ 0.99).  
+- On **test**, it predicts UP on **93.0% of days**.  
+- Balanced accuracy ≈ 0.50 on both splits; UP-vs-REST **AUC ≈ 0.50**.  
+- The confusion matrix confirms this behaviour:
+  - On test, most NOT_UP days are misclassified as UP (TN is tiny vs FP), while almost all UP days are predicted UP.
+
+In other words:
+
+> Even with balanced-accuracy tuning, the UP-vs-REST classifier degenerates into an **“almost always UP”** rule with essentially **random** ranking power.
+
+---
+
+#### Long-only trading metrics at τ\* = 0.10
+
+Because the signal is UP almost every day, the trading strategy is effectively “buy and hold with occasional days out of the market”.
+
+At τ\* = 0.10:
+
+- **Validation (2020)** – very strong BTC bull year
+  - Fraction of days in position ≈ **98.8%**
+  - Average daily return (strategy): **0.0035** (~0.35%/day)
+  - Cumulative return (2020): **+125%**
+  - Sharpe ratio: **1.30**
+  - Hit ratio (positive days when in position): **0.58**
+  - Average return when in position: **0.0036**
+
+- **Test (2021–2024)** – mix of bull and bear regimes
+  - Fraction of days in position ≈ **93.0%**
+  - Average daily return (strategy): **0.00063** (~0.06%/day)
+  - Cumulative return: **+23%** over 2021–2024
+  - Sharpe ratio: **0.32**
+  - Hit ratio: **0.47**
+  - Average return when in position: **0.00067**
+
+Because the model is invested on >90% of days, these numbers are very close to the underlying BTC buy-and-hold performance over the same periods:
+
+- The strategy’s **risk/return profile is largely driven by the unconditional BTC drift**, not by any genuine forecasting skill.
+- The modest positive Sharpe on test (≈0.3) is consistent with “being long most of the time” and does not constitute strong evidence of an edge.
+
+### 3.4 Conclusion – Impact of Decision Threshold (Experiment 5c)
+
+Experiment 5c shows that:
+
+1. **Changing the decision rule does not reveal hidden predictive power.**  
+   - Balanced-accuracy-based tuning selects **τ\* = 0.10**, the same threshold as F1-based tuning.  
+   - At τ\*, **balanced accuracy ≈ 0.5** and **AUC ≈ 0.5**, indicating **no useful binary signal** in P(UP).
+   - The classifier is effectively **always UP**, as evidenced by positive rates of 93–99% and the confusion matrices.
+
+2. **Trading results reflect market direction, not model skill.**  
+   - The long-only strategy at τ\* is in the market on >90% of days.  
+   - Its cumulative returns and Sharpe largely mirror BTC’s own behaviour in the respective periods (strong in 2020, modest overall in 2021–2024).  
+   - There is no sign of a robust, threshold-dependent outperformance relative to a naive always-long strategy.
+
+3. **Evaluation pipeline upgrade, not a performance upgrade.**  
+   - While 5c does not improve the model’s metrics, it provides a **cleaner and more realistic evaluation framework**:
+     - Threshold sweeps over P(UP),
+     - Balanced-accuracy-based τ\* selection,
+     - Transparent trading metrics and positive-rate reporting.
+   - This framework will be reused for later experiments (e.g. alternative labels, horizons, or architectures) to ensure **consistent, trading-aware evaluation**.
+
+Overall, Experiment 5c strengthens the negative conclusion from Experiments 3, 5a and 5b:
+
+> For 1-day BTC direction with daily OHLCV + TA + calendar/halving features, the TFT’s P(UP) scores do **not** contain a reliable, exploitable edge. No static decision threshold on P(UP) produces a robust UP-vs-REST classifier or trading strategy beyond a trivial “always long” baseline.

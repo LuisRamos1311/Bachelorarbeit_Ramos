@@ -3,21 +3,29 @@ evaluate_tft.py
 
 Evaluate a trained Temporal Fusion Transformer (TFT) model on the BTC dataset.
 
-Experiment 3 setup:
+Experiment 5c setup:
     - TASK_TYPE = "classification"  (3-class DOWN / FLAT / UP via direction_3c)
-    - 1-day-ahead prediction (single-horizon), but the code structure
-      is compatible with later multi-horizon extensions.
+    - 1-day-ahead prediction (single-horizon)
+    - UP-vs-REST analysis with:
+        * Manual threshold sweep over a fixed grid for P(UP)
+        * Selection of τ* on validation using THRESHOLD_SELECTION_METRIC
+          (e.g. balanced_accuracy)
+        * Simple long-only trading metrics based on 1-day forward returns
 
 Behaviour:
-    * Runs threshold search on the validation set to maximize a target metric
-      (e.g., F1) for UP-vs-REST and then evaluates the test set using that threshold.
+    * Computes full multi-class metrics on val/test.
+    * Sweeps thresholds τ ∈ UP_THRESHOLD_GRID on P(UP) for UP-vs-REST:
+        - classification metrics (accuracy, precision, recall, F1, etc.)
+        - trading metrics (avg return while in position, cumulative return,
+          Sharpe, hit ratio) from a long-only strategy.
+    * Chooses τ* on the validation set according to THRESHOLD_SELECTION_METRIC.
+    * Evaluates test UP-vs-REST and trading metrics at τ*.
     * Produces probability histograms, confusion matrices, and ROC curve.
-    * Saves all metrics into a JSON file in EXPERIMENTS_DIR, including
-      label configuration (log vs simple returns, threshold, horizons).
+    * Saves all metrics (including the per-threshold sweep) into JSON files.
 """
 
 import os
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 
 import numpy as np
 import torch
@@ -30,23 +38,24 @@ from experiment_5.config import (
     TASK_TYPE,
     EVAL_THRESHOLD,
     AUTO_TUNE_THRESHOLD,
-    THRESHOLD_SEARCH_MIN,
-    THRESHOLD_SEARCH_MAX,
-    THRESHOLD_SEARCH_STEPS,
-    THRESHOLD_TARGET_METRIC,
     BEST_MODEL_PATH,
     EXPERIMENTS_DIR,
     PLOTS_DIR,
     SEQ_LENGTH,
     NUM_CLASSES,
-    # Labeling configuration (log-returns experiment)
+    # Labeling configuration
     USE_LOG_RETURNS,
     DIRECTION_THRESHOLD,
     FORECAST_HORIZONS,
     USE_MULTI_HORIZON,
+    # Experiment 5c: threshold grid + selection metric
+    UP_THRESHOLD_GRID,
+    THRESHOLD_SELECTION_METRIC,
 )
 
 from experiment_5.data_pipeline import prepare_datasets
+# Assumes return_forward_returns=True is supported and returns
+# a dict with keys "train", "val", "test", "full" for future_return_1d
 from experiment_5.tft_model import TemporalFusionTransformer
 from experiment_5 import utils
 
@@ -146,8 +155,8 @@ def run_inference_classification(
             all_true.append(y_flat.cpu())
             all_prob.append(probs.cpu())
 
-    y_true = torch.cat(all_true, dim=0).numpy()          # (N,)
-    y_prob = torch.cat(all_prob, dim=0).numpy()          # (N, C)
+    y_true = torch.cat(all_true, dim=0).numpy()  # (N,)
+    y_prob = torch.cat(all_prob, dim=0).numpy()  # (N, C)
     avg_loss = total_loss / max(1, total_count)
 
     return y_true, y_prob, avg_loss
@@ -164,7 +173,7 @@ def main() -> None:
 
     # Show key labeling configuration so you can see at a glance
     print("[evaluate_tft] Label config:")
-    print(f"  USE_LOG_RETURNS    = {USE_LOG_RETURNS}")
+    print(f"  USE_LOG_RETURNS     = {USE_LOG_RETURNS}")
     print(f"  DIRECTION_THRESHOLD = {DIRECTION_THRESHOLD}")
     print(f"  FORECAST_HORIZONS   = {FORECAST_HORIZONS}")
     print(f"  USE_MULTI_HORIZON   = {USE_MULTI_HORIZON}")
@@ -172,12 +181,22 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 1. Prepare datasets & loaders
     # ------------------------------------------------------------------
-    print("[evaluate_tft] Preparing datasets.")
+    print("[evaluate_tft] Preparing datasets (with forward returns).")
 
-    # Use global SEQ_LENGTH from config
-    train_dataset, val_dataset, test_dataset, _ = prepare_datasets(
-        seq_length=SEQ_LENGTH
+    # Use global SEQ_LENGTH from config and request forward returns
+    (
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        _,
+        forward_returns,
+    ) = prepare_datasets(
+        seq_length=SEQ_LENGTH,
+        return_forward_returns=True,
     )
+
+    val_forward_returns = forward_returns["val"]
+    test_forward_returns = forward_returns["test"]
 
     print(f"[evaluate_tft] Train samples: {len(train_dataset)}")
     print(f"[evaluate_tft] Val samples:   {len(val_dataset)}")
@@ -207,9 +226,7 @@ def main() -> None:
     utils.ensure_dir(EXPERIMENTS_DIR)
     utils.ensure_dir(PLOTS_DIR)
 
-    metrics_out: Dict[str, Any] = {
-        # High-level run metadata will be filled below
-    }
+    metrics_out: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # 3. Evaluation paths by TASK_TYPE
@@ -227,7 +244,6 @@ def main() -> None:
             model, val_loader, device, criterion
         )
 
-        # Multi-class metrics (macro averages, etc.)
         val_mc_metrics = utils.compute_multiclass_metrics(
             y_true=y_val_true,
             y_prob=y_val_prob,
@@ -238,69 +254,7 @@ def main() -> None:
         for k, v in val_mc_metrics.items():
             print(f"  Val {k}: {v:.4f}")
 
-        # === Validation: UP vs REST threshold tuning ===
-        # For UP-vs-REST we treat the UP class (index NUM_CLASSES-1) as the positive class.
-        up_class_index = NUM_CLASSES - 1
-        y_val_up_true = (y_val_true == up_class_index).astype(int)
-        y_val_up_prob = y_val_prob[:, up_class_index]
-
-        if AUTO_TUNE_THRESHOLD:
-            thresholds = np.linspace(
-                THRESHOLD_SEARCH_MIN,
-                THRESHOLD_SEARCH_MAX,
-                THRESHOLD_SEARCH_STEPS,
-            )
-
-            best_threshold = None
-            best_metric_value = -np.inf
-            best_up_metrics: Dict[str, float] | None = None
-
-            for th in thresholds:
-                metrics = utils.compute_classification_metrics(
-                    y_true=y_val_up_true,
-                    y_prob=y_val_up_prob,
-                    threshold=th,
-                )
-                metric_value = metrics.get(
-                    THRESHOLD_TARGET_METRIC, metrics.get("f1", 0.0)
-                )
-
-                if metric_value > best_metric_value:
-                    best_metric_value = metric_value
-                    best_threshold = th
-                    best_up_metrics = metrics
-
-            up_threshold = float(best_threshold)
-            val_up_metrics = best_up_metrics or {}
-            print("[evaluate_tft] Validation UP-vs-REST threshold search "
-                  f"(optimize {THRESHOLD_TARGET_METRIC}):")
-            print(f"  Best P(UP) threshold on val: {up_threshold:.3f}")
-            for k, v in val_up_metrics.items():
-                print(f"  Val UP-vs-REST {k}: {v:.4f}")
-        else:
-            # Use fixed threshold from config
-            up_threshold = float(EVAL_THRESHOLD)
-            val_up_metrics = utils.compute_classification_metrics(
-                y_true=y_val_up_true,
-                y_prob=y_val_up_prob,
-                threshold=up_threshold,
-            )
-            print("[evaluate_tft] Validation UP-vs-REST (fixed threshold):")
-            print(f"  Using P(UP) threshold: {up_threshold:.3f}")
-            for k, v in val_up_metrics.items():
-                print(f"  Val UP-vs-REST {k}: {v:.4f}")
-
-        # Plot validation P(UP) histogram
-        val_hist_path = os.path.join(PLOTS_DIR, f"{eval_id}_val_up_prob_hist.png")
-        utils.plot_probability_histogram(
-            y_prob=y_val_up_prob,
-            out_path=val_hist_path,
-            threshold=up_threshold,
-            title="Val P(UP) Histogram (UP vs REST)",
-        )
-        print(f"[evaluate_tft] Validation P(UP) histogram saved to {val_hist_path}")
-
-        # === Test set: multi-class + UP-vs-REST using chosen threshold ===
+        # === Test set: multi-class metrics ===
         print("[evaluate_tft] Running inference on test set (multi-class).")
         y_test_true, y_test_prob, test_loss = run_inference_classification(
             model, test_loader, device, criterion
@@ -316,24 +270,207 @@ def main() -> None:
         for k, v in test_mc_metrics.items():
             print(f"  Test {k}: {v:.4f}")
 
-        # Binary UP vs REST on test
+        # ------------------------------------------------------------------
+        # 3a. UP-vs-REST: threshold sweep on P(UP) + trading metrics
+        # ------------------------------------------------------------------
+        up_class_index = NUM_CLASSES - 1  # 2 in the 3-class setup
+
+        # Binary labels for UP vs REST
+        y_val_up_true = (y_val_true == up_class_index).astype(int)
         y_test_up_true = (y_test_true == up_class_index).astype(int)
+
+        # Scores = P(UP)
+        y_val_up_prob = y_val_prob[:, up_class_index]
         y_test_up_prob = y_test_prob[:, up_class_index]
 
-        test_up_metrics = utils.compute_classification_metrics(
-            y_true=y_test_up_true,
-            y_prob=y_test_up_prob,
-            threshold=up_threshold,
-        )
+        # Threshold grid (fallback to EVAL_THRESHOLD if grid is empty)
+        threshold_grid: List[float] = list(UP_THRESHOLD_GRID) or [float(EVAL_THRESHOLD)]
 
-        print("[evaluate_tft] Test UP-vs-REST metrics "
-              f"(using P(UP) threshold={up_threshold:.3f}):")
+        print("[evaluate_tft] Threshold sweep on P(UP) for UP-vs-REST:")
+        print(f"  Grid: {threshold_grid}")
+        print(f"  Selection metric (val): {THRESHOLD_SELECTION_METRIC}")
+        print(f"  AUTO_TUNE_THRESHOLD   : {AUTO_TUNE_THRESHOLD}")
+
+        selection_key = THRESHOLD_SELECTION_METRIC.lower().strip()
+
+        sweep_records: List[Dict[str, Any]] = []
+
+        best_threshold: float | None = None
+        best_val_score: float = -np.inf
+        best_val_binary: Dict[str, float] | None = None
+        best_test_binary: Dict[str, float] | None = None
+        best_val_trading: Dict[str, float] | None = None
+        best_test_trading: Dict[str, float] | None = None
+
+        for th in threshold_grid:
+            th_float = float(th)
+
+            # Binary classification metrics on val/test
+            val_bin = utils.compute_classification_metrics(
+                y_true=y_val_up_true,
+                y_prob=y_val_up_prob,
+                threshold=th_float,
+            )
+            test_bin = utils.compute_classification_metrics(
+                y_true=y_test_up_true,
+                y_prob=y_test_up_prob,
+                threshold=th_float,
+            )
+
+            # Long-only strategy: long BTC on days with P(UP) >= τ
+            val_positions = utils.positions_from_threshold(
+                y_prob_up=y_val_up_prob,
+                threshold=th_float,
+            )
+            test_positions = utils.positions_from_threshold(
+                y_prob_up=y_test_up_prob,
+                threshold=th_float,
+            )
+
+            val_trading = utils.compute_trading_metrics(
+                returns=val_forward_returns,
+                positions=val_positions,
+            )
+            test_trading = utils.compute_trading_metrics(
+                returns=test_forward_returns,
+                positions=test_positions,
+            )
+
+            record = {
+                "threshold": th_float,
+                "val_binary": val_bin,
+                "test_binary": test_bin,
+                "val_trading": val_trading,
+                "test_trading": test_trading,
+            }
+            sweep_records.append(record)
+
+            # Selection of τ* is based on validation metrics only
+            if AUTO_TUNE_THRESHOLD:
+                if selection_key == "balanced_accuracy":
+                    score = val_bin.get("balanced_accuracy", float("nan"))
+                elif selection_key in {"macro_f1", "f1"}:
+                    # Prefer the explicit macro_f1 key if present
+                    score = val_bin.get("macro_f1", val_bin.get("f1", float("nan")))
+                else:
+                    score = val_bin.get(selection_key, float("nan"))
+
+                if not np.isnan(score) and score > best_val_score:
+                    best_val_score = score
+                    best_threshold = th_float
+                    best_val_binary = val_bin
+                    best_test_binary = test_bin
+                    best_val_trading = val_trading
+                    best_test_trading = test_trading
+
+        # Decide which threshold to report as τ*
+        if AUTO_TUNE_THRESHOLD:
+            if best_threshold is None:
+                # Fallback to EVAL_THRESHOLD if something went wrong
+                up_threshold = float(EVAL_THRESHOLD)
+                print("[evaluate_tft] WARNING: no valid threshold selected during "
+                      "sweep; falling back to EVAL_THRESHOLD="
+                      f"{up_threshold:.3f}.")
+                val_up_metrics = utils.compute_classification_metrics(
+                    y_true=y_val_up_true,
+                    y_prob=y_val_up_prob,
+                    threshold=up_threshold,
+                )
+                test_up_metrics = utils.compute_classification_metrics(
+                    y_true=y_test_up_true,
+                    y_prob=y_test_up_prob,
+                    threshold=up_threshold,
+                )
+                val_trading_best = utils.compute_trading_metrics(
+                    returns=val_forward_returns,
+                    positions=utils.positions_from_threshold(
+                        y_prob_up=y_val_up_prob,
+                        threshold=up_threshold,
+                    ),
+                )
+                test_trading_best = utils.compute_trading_metrics(
+                    returns=test_forward_returns,
+                    positions=utils.positions_from_threshold(
+                        y_prob_up=y_test_up_prob,
+                        threshold=up_threshold,
+                    ),
+                )
+            else:
+                up_threshold = float(best_threshold)
+                val_up_metrics = best_val_binary or {}
+                test_up_metrics = best_test_binary or {}
+                val_trading_best = best_val_trading or {}
+                test_trading_best = best_test_trading or {}
+
+                print("[evaluate_tft] Validation UP-vs-REST threshold sweep "
+                      f"(optimize {THRESHOLD_SELECTION_METRIC}):")
+                print(f"  Best P(UP) threshold on val: {up_threshold:.3f}")
+                print(f"  Best validation {THRESHOLD_SELECTION_METRIC}: "
+                      f"{best_val_score:.4f}")
+        else:
+            # No auto-tuning; evaluate at EVAL_THRESHOLD only
+            up_threshold = float(EVAL_THRESHOLD)
+            print("[evaluate_tft] Validation UP-vs-REST (fixed threshold):")
+            print(f"  Using P(UP) threshold: {up_threshold:.3f}")
+
+            val_up_metrics = utils.compute_classification_metrics(
+                y_true=y_val_up_true,
+                y_prob=y_val_up_prob,
+                threshold=up_threshold,
+            )
+            test_up_metrics = utils.compute_classification_metrics(
+                y_true=y_test_up_true,
+                y_prob=y_test_up_prob,
+                threshold=up_threshold,
+            )
+            val_trading_best = utils.compute_trading_metrics(
+                returns=val_forward_returns,
+                positions=utils.positions_from_threshold(
+                    y_prob_up=y_val_up_prob,
+                    threshold=up_threshold,
+                ),
+            )
+            test_trading_best = utils.compute_trading_metrics(
+                returns=test_forward_returns,
+                positions=utils.positions_from_threshold(
+                    y_prob_up=y_test_up_prob,
+                    threshold=up_threshold,
+                ),
+            )
+
+        # Print summary metrics at τ*
+        print(f"[evaluate_tft] Validation UP-vs-REST metrics "
+              f"(τ* = {up_threshold:.3f}):")
+        for k, v in val_up_metrics.items():
+            print(f"  Val {k}: {v:.4f}")
+
+        print(f"[evaluate_tft] Test UP-vs-REST metrics "
+              f"(τ* = {up_threshold:.3f}):")
         for k, v in test_up_metrics.items():
-            print(f"  Test UP-vs-REST {k}: {v:.4f}")
+            print(f"  Test {k}: {v:.4f}")
 
-        # ---- Plots for classification ----
+        # Trading summary at τ*
+        print("[evaluate_tft] Long-only trading metrics at τ* (1-day horizon):")
+        print("  Validation:")
+        for k, v in val_trading_best.items():
+            print(f"    {k}: {v:.6f}")
+        print("  Test:")
+        for k, v in test_trading_best.items():
+            print(f"    {k}: {v:.6f}")
 
-        # 1) Test P(UP) histogram
+        # ---- Plots: histograms, confusion matrices, ROC ----
+
+        # 1) Validation P(UP) histogram
+        val_hist_path = os.path.join(PLOTS_DIR, f"{eval_id}_val_up_prob_hist.png")
+        utils.plot_probability_histogram(
+            y_prob=y_val_up_prob,
+            out_path=val_hist_path,
+            threshold=up_threshold,
+            title="Val P(UP) Histogram (UP vs REST)",
+        )
+        print(f"[evaluate_tft] Validation P(UP) histogram saved to {val_hist_path}")
+
+        # 2) Test P(UP) histogram
         test_hist_path = os.path.join(PLOTS_DIR, f"{eval_id}_test_up_prob_hist.png")
         utils.plot_probability_histogram(
             y_prob=y_test_up_prob,
@@ -343,7 +480,7 @@ def main() -> None:
         )
         print(f"[evaluate_tft] Test P(UP) histogram saved to {test_hist_path}")
 
-        # 2) 3-class confusion matrix (argmax over logits)
+        # 3) 3-class confusion matrix (argmax over logits) on test
         y_test_pred_mc = np.argmax(y_test_prob, axis=1)
         cm_3c_path = os.path.join(
             PLOTS_DIR, f"{eval_id}_test_confusion_matrix_3class.png"
@@ -357,7 +494,7 @@ def main() -> None:
         )
         print(f"[evaluate_tft] 3-class confusion matrix saved to {cm_3c_path}")
 
-        # 3) Binary UP vs REST confusion matrix
+        # 4) Binary UP vs REST confusion matrix (test, at τ*)
         y_test_pred_up_bin = (y_test_up_prob >= up_threshold).astype(int)
         cm_bin_path = os.path.join(
             PLOTS_DIR, f"{eval_id}_test_confusion_matrix_up_vs_rest.png"
@@ -371,7 +508,7 @@ def main() -> None:
         )
         print(f"[evaluate_tft] UP-vs-REST confusion matrix saved to {cm_bin_path}")
 
-        # 4) ROC curve for UP vs REST
+        # 5) ROC curve for UP vs REST (test)
         roc_path = os.path.join(PLOTS_DIR, f"{eval_id}_test_roc_up_vs_rest.png")
         utils.plot_roc_curve(
             y_true=y_test_up_true,
@@ -395,15 +532,39 @@ def main() -> None:
                 "use_multi_horizon": bool(USE_MULTI_HORIZON),
             },
 
+            "seq_length": int(SEQ_LENGTH),
+            "eval_id": eval_id,
+            "model_checkpoint": BEST_MODEL_PATH,
+
+            # Multi-class CE losses
             "val_loss_ce": float(val_loss),
             "test_loss_ce": float(test_loss),
+
+            # Multi-class metrics
             "val_multiclass": val_mc_metrics,
             "test_multiclass": test_mc_metrics,
-            "up_class_index": int(up_class_index),
-            "up_prob_threshold": float(up_threshold),
-            "val_up_vs_rest": val_up_metrics,
-            "test_up_vs_rest": test_up_metrics,
+
+            # UP-vs-REST configuration and metrics
+            "up_vs_rest": {
+                "up_class_index": int(up_class_index),
+                "auto_tune_threshold": bool(AUTO_TUNE_THRESHOLD),
+                "selection_metric": THRESHOLD_SELECTION_METRIC,
+                "selected_threshold": float(up_threshold),
+                "val_binary_metrics": val_up_metrics,
+                "test_binary_metrics": test_up_metrics,
+                "val_trading_metrics": val_trading_best,
+                "test_trading_metrics": test_trading_best,
+                # Full sweep for later plotting / analysis
+                "threshold_sweep": sweep_records,
+            },
         }
+
+        # Also save just the sweep as a separate JSON for convenience
+        sweep_path = os.path.join(
+            EXPERIMENTS_DIR, f"{eval_id}_up_vs_rest_threshold_sweep.json"
+        )
+        utils.save_json(sweep_records, sweep_path)
+        print(f"[evaluate_tft] Threshold sweep saved to {sweep_path}")
 
     else:
         raise NotImplementedError(

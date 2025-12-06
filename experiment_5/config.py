@@ -338,3 +338,17 @@ THRESHOLD_SEARCH_STEPS: int = 17  # e.g. 0.10, 0.15, ..., 0.90
 # Which metric to maximize during tuning: "f1", "accuracy",
 # "precision", or "recall".
 THRESHOLD_TARGET_METRIC: str = "f1"
+
+# ----------------------------
+# Experiment 5c: UP-vs-REST threshold grid
+# ----------------------------
+# For Experiment 5c we also define an explicit grid of P(UP) thresholds
+# and a selection metric for choosing τ* on the validation set.
+# These will be used inside evaluate_tft.py instead of the dense linspace
+# search above, to make the operating points more interpretable.
+UP_THRESHOLD_GRID: List[float] = [0.10, 0.20, 0.30, 0.40, 0.50]
+
+# Metric to use when selecting τ* from UP_THRESHOLD_GRID on the validation set.
+# We use "balanced_accuracy" to penalize always-UP behaviour and give equal
+# weight to correctly identifying UP and correctly rejecting NOT_UP.
+THRESHOLD_SELECTION_METRIC: str = "balanced_accuracy"
