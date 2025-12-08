@@ -29,7 +29,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from experiment_7 import config
+from experiment_7b import config
 
 
 # ============================

@@ -1,0 +1,347 @@
+{
+  "task_type": "classification",
+  "num_classes": 3,
+  "class_encoding": {
+    "0": "DOWN",
+    "1": "FLAT",
+    "2": "UP"
+  },
+  "label_config": {
+    "use_log_returns": true,
+    "direction_threshold": 0.005,
+    "forecast_horizons": [
+      24
+    ],
+    "use_multi_horizon": false,
+    "frequency": "1h",
+    "horizon_steps": 24,
+    "non_overlapping_trades": true
+  },
+  "seq_length": 96,
+  "eval_id": "tft_eval_20251208_230754",
+  "model_checkpoint": "C:\\Users\\laro1\\PycharmProjects\\Bachelorarbeit_Ramos\\experiment_7b\\models\\tft_btc_best.pth",
+  "val_loss_ce": 1.5103110389174959,
+  "test_loss_ce": 1.5153708051500787,
+  "val_multiclass": {
+    "accuracy": 0.3817470364829094,
+    "precision": 0.3680969215184475,
+    "recall": 0.3683286877816487,
+    "f1": 0.36591657030516256,
+    "auc": 0.5443039684038506
+  },
+  "test_multiclass": {
+    "accuracy": 0.37104015964080816,
+    "precision": 0.3684634234971343,
+    "recall": 0.3696509801692384,
+    "f1": 0.3667366551142781,
+    "auc": 0.5312030178786419
+  },
+  "up_vs_rest": {
+    "up_class_index": 2,
+    "auto_tune_threshold": true,
+    "selection_metric": "sharpe",
+    "selected_threshold": 0.35,
+    "val_binary_metrics": {
+      "accuracy": 0.5375762458280585,
+      "balanced_accuracy": 0.5206063338382447,
+      "precision": 0.44641275465013286,
+      "recall": 0.4136798905608755,
+      "f1": 0.4294234592445328,
+      "macro_f1": 0.5203425345758268,
+      "auc": 0.5337156582842688,
+      "positive_rate": 0.3898031994475774
+    },
+    "test_binary_metrics": {
+      "accuracy": 0.517959590920429,
+      "balanced_accuracy": 0.5069813835699952,
+      "precision": 0.3895637769188294,
+      "recall": 0.4603588907014682,
+      "f1": 0.42201286077463734,
+      "macro_f1": 0.5042998307509939,
+      "auc": 0.5294311388388535,
+      "positive_rate": 0.451733599401347
+    },
+    "val_trading_metrics": {
+      "avg_daily_return": 0.0010975779788478656,
+      "cumulative_return": 0.3865362229520328,
+      "sharpe": 0.871366370028396,
+      "hit_ratio": 0.2066115702479339,
+      "avg_return_in_position": 0.0028871072921867764
+    },
+    "test_trading_metrics": {
+      "avg_daily_return": 0.0006501646091203584,
+      "cumulative_return": 0.19696153404482009,
+      "sharpe": 0.6857006789186255,
+      "hit_ratio": 0.24776119402985075,
+      "avg_return_in_position": 0.0014051944777762585
+    },
+    "threshold_sweep": [
+      {
+        "threshold": 0.35,
+        "val_binary": {
+          "accuracy": 0.5375762458280585,
+          "balanced_accuracy": 0.5206063338382447,
+          "precision": 0.44641275465013286,
+          "recall": 0.4136798905608755,
+          "f1": 0.4294234592445328,
+          "macro_f1": 0.5203425345758268,
+          "auc": 0.5337156582842688,
+          "positive_rate": 0.3898031994475774
+        },
+        "test_binary": {
+          "accuracy": 0.517959590920429,
+          "balanced_accuracy": 0.5069813835699952,
+          "precision": 0.3895637769188294,
+          "recall": 0.4603588907014682,
+          "f1": 0.42201286077463734,
+          "macro_f1": 0.5042998307509939,
+          "auc": 0.5294311388388535,
+          "positive_rate": 0.451733599401347
+        },
+        "val_trading": {
+          "avg_daily_return": 0.0010975779788478656,
+          "cumulative_return": 0.3865362229520328,
+          "sharpe": 0.871366370028396,
+          "hit_ratio": 0.2066115702479339,
+          "avg_return_in_position": 0.0028871072921867764
+        },
+        "test_trading": {
+          "avg_daily_return": 0.0006501646091203584,
+          "cumulative_return": 0.19696153404482009,
+          "sharpe": 0.6857006789186255,
+          "hit_ratio": 0.24776119402985075,
+          "avg_return_in_position": 0.0014051944777762585
+        },
+        "selection_score": 0.871366370028396
+      },
+      {
+        "threshold": 0.4,
+        "val_binary": {
+          "accuracy": 0.5402232708021637,
+          "balanced_accuracy": 0.5175694470487144,
+          "precision": 0.4448051948051948,
+          "recall": 0.3748290013679891,
+          "f1": 0.40682999257609503,
+          "macro_f1": 0.5157329517517326,
+          "auc": 0.5337156582842688,
+          "positive_rate": 0.3544711704453907
+        },
+        "test_binary": {
+          "accuracy": 0.5295584933898728,
+          "balanced_accuracy": 0.5105244107003879,
+          "precision": 0.39419335528284943,
+          "recall": 0.42969004893964113,
+          "f1": 0.41117702154230407,
+          "macro_f1": 0.5097421971678291,
+          "auc": 0.5294311388388535,
+          "positive_rate": 0.416687453230232
+        },
+        "val_trading": {
+          "avg_daily_return": 0.0007436297378489818,
+          "cumulative_return": 0.23098173766693342,
+          "sharpe": 0.632906186602493,
+          "hit_ratio": 0.18181818181818182,
+          "avg_return_in_position": 0.0021595007587134445
+        },
+        "test_trading": {
+          "avg_daily_return": 0.00046566467822727704,
+          "cumulative_return": 0.13057480572968871,
+          "sharpe": 0.5249271763908542,
+          "hit_ratio": 0.21791044776119403,
+          "avg_return_in_position": 0.001106366434086084
+        },
+        "selection_score": 0.632906186602493
+      },
+      {
+        "threshold": 0.45,
+        "val_binary": {
+          "accuracy": 0.5441362642421452,
+          "balanced_accuracy": 0.5161872454722388,
+          "precision": 0.4452005730659026,
+          "recall": 0.34008207934336526,
+          "f1": 0.3856057080812781,
+          "macro_f1": 0.5116208944760978,
+          "auc": 0.5337156582842688,
+          "positive_rate": 0.32132581424789963
+        },
+        "test_binary": {
+          "accuracy": 0.543527064105762,
+          "balanced_accuracy": 0.5141199707923321,
+          "precision": 0.40020127474002015,
+          "recall": 0.38923327895595433,
+          "f1": 0.3946410850148859,
+          "macro_f1": 0.5141373593242597,
+          "auc": 0.5294311388388535,
+          "positive_rate": 0.37178847592915937
+        },
+        "val_trading": {
+          "avg_daily_return": 0.0006918901260018353,
+          "cumulative_return": 0.21073540004890567,
+          "sharpe": 0.5993844882271405,
+          "hit_ratio": 0.1652892561983471,
+          "avg_return_in_position": 0.002183966223814489
+        },
+        "test_trading": {
+          "avg_daily_return": 0.00034800753252917246,
+          "cumulative_return": 0.09654134551996463,
+          "sharpe": 0.455780647300957,
+          "hit_ratio": 0.1761194029850746,
+          "avg_return_in_position": 0.0009879874864175664
+        },
+        "selection_score": 0.5993844882271405
+      },
+      {
+        "threshold": 0.5,
+        "val_binary": {
+          "accuracy": 0.5510415467832892,
+          "balanced_accuracy": 0.5178746493746762,
+          "precision": 0.4508785942492013,
+          "recall": 0.30889192886456907,
+          "f1": 0.3666179574606267,
+          "macro_f1": 0.5094521287436835,
+          "auc": 0.5337156582842688,
+          "positive_rate": 0.28818045805040854
+        },
+        "test_binary": {
+          "accuracy": 0.5604888999750561,
+          "balanced_accuracy": 0.5205735874808848,
+          "precision": 0.41210264266564534,
+          "recall": 0.3510603588907015,
+          "f1": 0.37914023960535587,
+          "macro_f1": 0.5194928997254579,
+          "auc": 0.5294311388388535,
+          "positive_rate": 0.3256423048141681
+        },
+        "val_trading": {
+          "avg_daily_return": 0.0003289734406018586,
+          "cumulative_return": 0.0704234864204214,
+          "sharpe": 0.30864347721284363,
+          "hit_ratio": 0.1487603305785124,
+          "avg_return_in_position": 0.0011593918343541236
+        },
+        "test_trading": {
+          "avg_daily_return": 0.0005258936227908683,
+          "cumulative_return": 0.16490176418941926,
+          "sharpe": 0.7017740121358726,
+          "hit_ratio": 0.16417910447761194,
+          "avg_return_in_position": 0.0017104307149023387
+        },
+        "selection_score": 0.30864347721284363
+      },
+      {
+        "threshold": 0.55,
+        "val_binary": {
+          "accuracy": 0.5487397859362412,
+          "balanced_accuracy": 0.5102295362805155,
+          "precision": 0.44014401440144013,
+          "recall": 0.26757865937072506,
+          "f1": 0.3328228688106177,
+          "macro_f1": 0.4959479964433925,
+          "auc": 0.5337156582842688,
+          "positive_rate": 0.25572563010703186
+        },
+        "test_binary": {
+          "accuracy": 0.5732102768770266,
+          "balanced_accuracy": 0.5240302234149455,
+          "precision": 0.42201834862385323,
+          "recall": 0.31517128874388256,
+          "f1": 0.36085169966380276,
+          "macro_f1": 0.5202498528275951,
+          "auc": 0.5294311388388535,
+          "positive_rate": 0.28548266400598654
+        },
+        "val_trading": {
+          "avg_daily_return": 0.0005116021408240178,
+          "cumulative_return": 0.14700601103095012,
+          "sharpe": 0.49324135006081427,
+          "hit_ratio": 0.1349862258953168,
+          "avg_return_in_position": 0.002040786561748555
+        },
+        "test_trading": {
+          "avg_daily_return": 0.0008678080743055002,
+          "cumulative_return": 0.31103147416189625,
+          "sharpe": 1.2587803361964,
+          "hit_ratio": 0.15223880597014924,
+          "avg_return_in_position": 0.0032301744988038057
+        },
+        "selection_score": 0.49324135006081427
+      },
+      {
+        "threshold": 0.6,
+        "val_binary": {
+          "accuracy": 0.551847163079756,
+          "balanced_accuracy": 0.5078522680519391,
+          "precision": 0.43792207792207793,
+          "recall": 0.23064295485636116,
+          "f1": 0.3021505376344086,
+          "macro_f1": 0.4860472979746886,
+          "auc": 0.5337156582842688,
+          "positive_rate": 0.2215444815283692
+        },
+        "test_binary": {
+          "accuracy": 0.5813170366674981,
+          "balanced_accuracy": 0.5218862527991506,
+          "precision": 0.42489711934156377,
+          "recall": 0.2694942903752039,
+          "f1": 0.32980634857256935,
+          "macro_f1": 0.5126858894399983,
+          "auc": 0.5294311388388535,
+          "positive_rate": 0.24245447742579196
+        },
+        "val_trading": {
+          "avg_daily_return": 0.0005021376716664331,
+          "cumulative_return": 0.14720118484599554,
+          "sharpe": 0.5026933576046914,
+          "hit_ratio": 0.1184573002754821,
+          "avg_return_in_position": 0.0023368714719860925
+        },
+        "test_trading": {
+          "avg_daily_return": 0.0008001075452374671,
+          "cumulative_return": 0.2833926591931988,
+          "sharpe": 1.2024290500084305,
+          "hit_ratio": 0.13432835820895522,
+          "avg_return_in_position": 0.003480987372137033
+        },
+        "selection_score": 0.5026933576046914
+      },
+      {
+        "threshold": 0.65,
+        "val_binary": {
+          "accuracy": 0.5596731499597192,
+          "balanced_accuracy": 0.5103342686965299,
+          "precision": 0.44751381215469616,
+          "recall": 0.199452804377565,
+          "f1": 0.27592732778198337,
+          "macro_f1": 0.4797860551593892,
+          "auc": 0.5337156582842688,
+          "positive_rate": 0.18747842099205891
+        },
+        "test_binary": {
+          "accuracy": 0.5829383886255924,
+          "balanced_accuracy": 0.5131870907904613,
+          "precision": 0.4133001864512119,
+          "recall": 0.2169657422512235,
+          "f1": 0.2845528455284553,
+          "macro_f1": 0.4951192321287761,
+          "auc": 0.5294311388388535,
+          "positive_rate": 0.2006734846595161
+        },
+        "val_trading": {
+          "avg_daily_return": 0.0005544790225210394,
+          "cumulative_return": 0.1754156245338565,
+          "sharpe": 0.5901081552522686,
+          "hit_ratio": 0.09917355371900827,
+          "avg_return_in_position": 0.0030496346238657168
+        },
+        "test_trading": {
+          "avg_daily_return": 0.0006160020311462048,
+          "cumulative_return": 0.2080641984140521,
+          "sharpe": 0.9558216212234636,
+          "hit_ratio": 0.11044776119402985,
+          "avg_return_in_position": 0.0031266769762724037
+        },
+        "selection_score": 0.5901081552522686
+      }
+    ]
+  }
+}

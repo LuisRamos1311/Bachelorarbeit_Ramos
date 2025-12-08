@@ -1,434 +1,272 @@
-# Experiment 6 – Hourly 24h-Ahead Directional TFT on BTC
+# Experiment 7 – Hourly 24h-Ahead TFT with Technical + On-Chain BTC Features
 
 ## 1. Goal
 
-Build on the daily TFT experiments (Exp. 1–5) and test whether a **Temporal Fusion Transformer** can better forecast BTC direction when it sees **hourly data** and predicts the **24-hour-ahead** move instead of the next daily close.  
-In parallel:
+Build directly on the hourly 24h-ahead TFT baseline from Experiment 6 and test whether adding a compact on-chain feature set improves:
 
-1. Fix a flaw in the trading backtest for 24h horizons (overlapping trades),
-2. Tidy up the training procedure with **slightly stronger regularisation and fewer epochs**.
+- 24h-ahead **3-class direction** prediction (DOWN / FLAT / UP), and  
+- a **long-only UP-vs-REST trading strategy** on BTC.
 
-Experiments 1–5 defined and stress-tested the daily baseline (regression → 3-class direction on log-returns, different thresholds, and various decision rules / time splits).   
-Experiment 6 is the continuation of that line, but on **hourly BTC**.
+Everything except the feature set (data splits, label, model, training, evaluation) is kept identical to Experiment 6 to allow a clean comparison.
 
 ---
 
-## 2. Data & Targets
+## 2. Data, Features & Targets
 
-### 2.1 Data
+### Data
 
-- Source: `BTCUSD_hourly.csv` (CryptoDataDownload-style).
-- Period used for this experiment: **2018-01-01 to ~2025-XX-XX**.
-- Frequency: **1h** candlesticks.
-- Time splits (by calendar year, same philosophy as daily experiments):
+Same setup as Experiment 6:
 
-  - **Train**: 2018–2023  
-  - **Val**: 2024  
-  - **Test**: 2025  
+- Source: `BTCUSD_hourly.csv`
+- Period: **2018–2025**
+- Frequency: **1h** candles
+- Splits:
+  - Train: **2018–2023**
+  - Val: **2024**
+  - Test: **2025**
+- Window:
+  - Lookback: `SEQ_LENGTH = 96` hours (4 days)
+  - Horizon: `HORIZON = 24` hours (24h ahead on the hourly grid)
+- Sample counts (approx.):
+  - Train: **49k**
+  - Val: **8.7k**
+  - Test: **8.0k**
+- Label balance (FULL 2018–2025):
+  - DOWN ≈ **37%**, FLAT ≈ **22%**, UP ≈ **41%**
 
-- Sliding window:
+### Features
 
-  - Lookback: `SEQ_LENGTH = 96` hours (4 days).
-  - Forecast horizon: `HORIZON = 24` hours (1 day ahead, but on the hourly grid).
+We reuse all **technical features** from Experiment 6 and add 5 derived on-chain metrics.
 
-- Sample counts (after building sequences and dropping rows that lack future data):
-
-  - Train: **~49k** samples  
-  - Val: **~8.7k** samples  
-  - Test: **~8.0k** samples  
-
-- Label balance (FULL 2018–2025) with the final configuration:
-
-  - DOWN: **37.1%**  
-  - FLAT: **22.2%**  
-  - UP:   **40.7%**  
-
-  Train/val/test splits have very similar proportions.
-
-### 2.2 Features
-
-Feature engineering is conceptually the same as in the daily experiments, but applied to **hourly** candles:
-
-**Past covariates (per hour)**
-
-- OHLCV:
-  - `open`, `high`, `low`, `close`
-  - `volume_btc`, `volume_usd`
-- Technical indicators (computed on hourly closes):
+**Base (past) features (as in Exp. 6)**  
+- OHLCV (hourly): `open, high, low, close, volume_btc, volume_usd`  
+- Technical indicators on hourly closes:
   - `roc_10`, `atr_14`
   - `macd`, `macd_signal`, `macd_hist`
   - `rsi_14`
-- Calendar / halving:
-  - Hour of day, day of week, month, weekend flag
-  - Halving window indicators (aligned to dates, then broadcast to hours)
+- Calendar / halving flags:
+  - hour of day, day of week, month, weekend indicator
+  - halving-window indicators  
 
-Scaling reuses the same scheme as the daily TFT:
+These 12 past features are scaled with:
 
-- Price / volume columns → `MinMaxScaler`
-- Indicator columns → `StandardScaler`
+- `PRICE_VOLUME_COLS` → `MinMaxScaler`
+- `INDICATOR_COLS` → `StandardScaler`
 
-**Known future covariates (t+24)**
+**New on-chain features (daily → broadcast to hours)**
 
-Because the horizon is 24 hours, the “known future” vector contains features for the **end of the forecast window** (t+24h):
+From a daily BTC on-chain CSV:
 
-- `dow_next`, `is_weekend_next`, `month_next`, `is_halving_window_next`
-- Plus one extra known-future flag (final hourly setup uses 5 future features in total).
+- Raw daily series:
+  - `active_addresses`
+  - `tx_count`
+  - `mvrv`
+  - `sopr`
+  - `hash_rate`
 
-These are obtained via a 24-step `shift(-24)` and form a 5-dim vector per sample.
+We derive 5 features and forward-fill them to all hours of that day:
 
-### 2.3 Target: 24h Log-Return Direction (3-Class)
+- `aa_ma_ratio  = active_addresses / MA_7(active_addresses)`
+- `tx_ma_ratio  = tx_count / MA_7(tx_count)`
+- `hash_ma_ratio = hash_rate / MA_30(hash_rate)`
+- `mvrv_z      = z-score(mvrv)` (standardised later using train stats)
+- `sopr_z      = z-score(sopr)` (standardised later using train stats)
 
-I keep the **log-return** framework from Experiment 3, but with a **24h horizon** instead of 1 day. :contentReference[oaicite:1]{index=1}  
+These are added to `FEATURE_COLS` and scaled together with indicators via `StandardScaler`:
 
-For each hour *t*:
+```python
+FEATURE_COLS = PRICE_VOLUME_COLS + INDICATOR_COLS + ONCHAIN_COLS
+ONCHAIN_COLS = ["aa_ma_ratio", "tx_ma_ratio", "mvrv_z", "sopr_z", "hash_ma_ratio"]
+````
 
-1. Compute **24h log return**:
+Total past features: **17** (12 technical + 5 on-chain).
 
-\[
-\text{log\_return\_24h}(t) =
-\log\left(\frac{\text{close}_{t+24}}{\text{close}_t}\right)
-\]
+**Known future covariates (unchanged)**  
 
-2. Apply a symmetric dead-zone with `DIRECTION_THRESHOLD = 0.005` (≈0.5%):
+- 5 “known-future” features at `t+24h` (calendar/halving style), as in Experiment 6.
 
-- `0 = DOWN` if `log_return_24h < −0.005`  
-- `1 = FLAT` if `|log_return_24h| ≤ 0.005`  
-- `2 = UP`   if `log_return_24h > +0.005`
+### Target
 
-Config flags for this experiment:
+Same 24h log-return 3-class label as Experiment 6:
+
+- Compute 24h log-return:
+
+  log_return_24h(t) = log(close[t+24] / close[t])
+
+- Apply a symmetric dead-zone with `DIRECTION_THRESHOLD = 0.005`:
+
+  - `0 = DOWN` if log_return_24h < −0.005  
+  - `1 = FLAT` if |log_return_24h| ≤ 0.005  
+  - `2 = UP`   if log_return_24h > +0.005  
+
+Config flags:
 
 - `USE_LOG_RETURNS = True`
 - `FORECAST_HORIZONS = [24]`
-- `USE_MULTI_HORIZON = False` (single-horizon classification)
+- `USE_MULTI_HORIZON = False`
 - `FREQUENCY = "1h"`
 - `TARGET_COLUMN = "direction_3c"`
 - `NUM_CLASSES = 3`
+- `NON_OVERLAPPING_TRADES = True` (one 24h trade at a time, as in Exp. 6)
 
 ---
 
 ## 3. Model & Training
 
-### 3.1 Model
+### Model
 
-I reuse the **simplified Temporal Fusion Transformer** encoder from earlier experiments:
+We reuse the simplified Temporal Fusion Transformer from Experiment 6, with a larger input size:
 
-- Variable Selection Network (VSN) over 12 past features
+- Input projection: `input_size = len(FEATURE_COLS) = 17 → 64`
+- Variable Selection Network (VSN) over 17 past features
 - LSTM encoder:
   - `hidden_size = 64`
-- Multi-head self-attention:
-  - `num_heads = 4`
-- Gated Residual Networks (GRNs):
-  - post-LSTM encoder
+- Multi-head self-attention (`num_heads = 4`)
+- Gated Residual Networks (GRNs) for:
+  - post-LSTM
   - attention output
   - temporal feed-forward block
-  - future-covariate encoder
-  - decision GRN (fusing history + future)
-- Future covariate encoder for 5 known-future features.
-- Final linear layer:
-  - `output_size = 3` → logits for `[DOWN, FLAT, UP]`.
+  - future covariate encoder (5-dim future vector)
+  - decision GRN (history + future)
+- Output layer: `64 → 3` logits (`[DOWN, FLAT, UP]`)
 
-Compared to the daily TFT, the **architecture is unchanged**; only the input sequence length and the semantics of the horizon change.
+No structural changes vs Experiment 6; the TFT just sees 5 extra on-chain inputs.
 
-### 3.2 Training (final Experiment-6 configuration)
+### Training
 
-Script: `experiment_6/train_tft.py`
+Script: `experiment_7/train_tft.py` (copied from Exp. 6 with minor logging updates).
+
+Config (identical to Experiment 6 to keep comparison fair):
 
 - Task: `TASK_TYPE = "classification"`
-- Label: `TARGET_COLUMN = "direction_3c"` (24h log-return)
 - Loss: `CrossEntropyLoss`
 - Optimizer: Adam
-- Hyperparameters (after the regularisation update):
-
-  - Batch size: `64`
-  - Learning rate: `1e-3`
-  - **Weight decay**: `1e-4` (was `1e-5`)
-  - **Dropout** (all GRNs & MLPs): `0.2` (was `0.1`)
-  - **Epochs**: `12` (was `20`)
-
-- Model selection:
-
-  - **Best validation macro-F1** (3-class) across epochs.
-  - The corresponding checkpoint is saved as `experiment_6/models/tft_btc_best.pth`.
-
-The training script also logs per-epoch train/val loss and F1 and saves training curves as `plots/..._training_curves.png`.
+- Batch size: `64`
+- Learning rate: `1e-3`
+- Weight decay: `1e-4`
+- Dropout (all GRNs): `0.2`
+- Epochs: `12`
+- Model selection: best validation macro-F1 (3-class)  
+  → best checkpoint saved as `experiment_7/models/tft_btc_best.pth`.
 
 ---
 
-## 4. Experiment Journey & Design Decisions
+## 4. Evaluation & Comparison to Experiment 6
 
-This experiment went through **three main phases**, all under the umbrella of “Experiment 6”. Each step fixed a specific issue or design choice rather than starting from scratch.
+Evaluation is done by `experiment_7/evaluate_tft.py` and mirrors Experiment 6:
 
-### 4.1 Phase 1 – From Daily (Exp. 5) to Hourly 24h-Ahead TFT
+1. Compute 3-class metrics (DOWN / FLAT / UP) on val/test.
+2. Collapse to binary **UP vs REST** (REST = {DOWN, FLAT}) and:
+   - sweep a small grid of thresholds on `P(UP)` (`[0.1, 0.2, 0.3, 0.4, 0.5]`),
+   - choose τ* that maximises balanced accuracy on validation,
+   - evaluate UP-vs-REST metrics on test at τ*.
+3. Using τ*, run a non-overlapping long-only trading strategy:
+   - if `P(UP)_t ≥ τ*`, go long BTC from *t* to *t+24h*, otherwise stay flat.
 
-**Motivation**
+### 4.1 3-Class Direction (DOWN / FLAT / UP)
 
-Daily Experiment 5 used:
+**Experiment 6 (technical only, summary)**  
 
-- daily candles (2014–2025)  
-- 1-day-ahead 3-class log-return direction  
-- TFT with 30-day input window  
-
-It consistently produced:
-
-- Test 3-class macro-F1 ≈ **0.37**, macro-AUC ≈ **0.55**,  
-- UP-vs-REST AUC ≈ **0.50** (almost random),  
-- A degenerate decision rule where the F1-optimal threshold essentially predicted **UP on almost every day**. :contentReference[oaicite:2]{index=2}  
-
-The hypothesis for Experiment 6 was:
-
-> Maybe **hourly structure** (intraday volatility, micro-trends) contains more predictability for the **next 24 hours** than a single daily close.
-
-**Changes in Phase 1**
-
-- Switch from daily to **hourly data (1h)**.
-- Use a **96-hour lookback** and **24-hour ahead** horizon.
-- Keep the 3-class log-return label (`DOWN/FLAT/UP` with ±0.5% dead-zone).
-- Keep the same TFT architecture and almost identical training config:
-  - dropout `0.1`, weight decay `1e-5`, `20` epochs.
-
-**Initial results (overlapping 24h trades)**
-
-- 3-class metrics (test):
-
+- **Val (2024)**:
+  - Accuracy ≈ **0.43**
+  - Macro-F1 ≈ **0.40**
+  - Macro-AUC ≈ **0.57**
+- **Test (2025)**:
   - Accuracy ≈ **0.39**
-  - Macro-F1 ≈ **0.34**
+  - Macro-F1 ≈ **0.36**
   - Macro-AUC ≈ **0.55**
 
-  → Very similar to the daily baseline.
+**Experiment 7 (technical + on-chain)**
 
-- UP-vs-REST (tuned on balanced accuracy, threshold τ ≈ `0.50`):
+- **Val (2024)**:
+  - Accuracy: **0.38**
+  - Macro-F1: **0.37**
+  - Macro-AUC: **0.52**
+- **Test (2025)**:
+  - Accuracy: **0.36**
+  - Macro-F1: **0.36**
+  - Macro-AUC: **0.53**
 
-  - Test accuracy ≈ **0.60**
-  - Balanced accuracy ≈ **0.51**
-  - F1 ≈ **0.24**
-  - AUC ≈ **0.53**, positive_rate ≈ **0.15**
+**Takeaway:**  
+Adding on-chain features does not noticeably improve the pure 3-class direction task. Accuracy and macro-F1 stay around 0.36–0.40, and macro-AUC remains only slightly above random.
 
-  → Slightly informative but still weak.
+### 4.2 UP-vs-REST (Binary) & Trading
 
-- **Trading metrics (buggy):**
+Here the on-chain features have a more visible effect.
 
-  The initial trading backtest opened a new 24h-ahead position **every hour**, creating **24 overlapping trades** at any given time. With this overlapping-trade logic, the validation cumulative return inflated to **~×72**, which is clearly unrealistic and not comparable to any daily strategy.
+**Threshold selection**
 
-**Conclusion of Phase 1**
+- Exp. 6: best τ* ≈ **0.40**
+- Exp. 7: best τ* ≈ **0.50**
 
-- Purely from a predictive standpoint, hourly data **did not magically solve** the problem:
-  - test macro-F1 and AUC were in the same ballpark as the daily baseline.
-- However, the model behaved slightly less pathologically in UP-vs-REST (less “always UP”).
-- The trading backtest needed to be fixed before any serious comparison.
+**UP-vs-REST metrics (test)**
 
----
+- **Experiment 6** (τ* = 0.40, tech only)  
+  - Accuracy: **0.56**
+  - Balanced accuracy: **0.50**
+  - Precision (UP): **0.38**
+  - Recall (UP): **0.24**
+  - F1 (UP): **0.29**
+  - AUC: **0.51**
+  - Positive rate: **0.24**
 
-### 4.2 Phase 2 – Fixing Overlapping 24h Trades (Non-Overlapping)
+- **Experiment 7** (τ* = 0.50, tech + on-chain)  
+  - Accuracy: **0.55**
+  - Balanced accuracy: **0.52**
+  - Precision (UP): **0.40**
+  - Recall (UP): **0.36**
+  - F1 (UP): **0.38**
+  - AUC: **0.52**
+  - Positive rate: **0.34**
 
-**Problem**
+**Takeaway:**
 
-For a 24h horizon on **hourly** data, opening a fresh position at every hour applies the *same* 24h view 24 times in parallel. This:
+- The ranking power (AUC) is still weak (~0.52), but:
+  - Recall for UP improves (≈24% → 36%),
+  - F1 for UP improves (≈0.29 → 0.38),
+  - Balanced accuracy and macro-F1 also improve slightly,
+  - The model issues more UP signals (positive_rate increases) with better quality.
 
-- artificially amplifies exposure and cumulative return,  
-- makes Sharpe and hit ratios hard to interpret,  
-- is inconsistent with the **1-trade-per-day** interpretation used on daily data.
+This suggests that on-chain features help the TFT detect UP regimes a bit better, even if overall classification remains hard.
 
-**Fix**
+**Long-only trading (non-overlapping 24h trades)**
 
-Introduce a config flag:
+Using τ* from each experiment:
 
-- `NON_OVERLAPPING_TRADES = True`
+- **Validation (2024)**  
+  - **Exp. 6**:  
+    - Cumulative return ≈ **+19%**, Sharpe ≈ **0.57**, hit ratio ≈ **0.18**
+  - **Exp. 7**:  
+    - Cumulative return ≈ **+50%**, Sharpe ≈ **1.19**, hit ratio ≈ **0.24**
 
-and change the trading evaluation in `evaluate_tft.py` so that:
+- **Test (2025)**  
+  - **Exp. 6**:  
+    - Cumulative return ≈ **−11.6%**, Sharpe ≈ **−0.45**, hit ratio ≈ **0.10**
+  - **Exp. 7**:  
+    - Cumulative return ≈ **−4.0%**, Sharpe ≈ **−0.01**, hit ratio ≈ **0.18**
 
-- For each **24-hour horizon**, only evaluate a decision **once per 24 hours**.
-- When `NON_OVERLAPPING_TRADES = True` and `HORIZON = 24`, the code:
+**Takeaway:**
 
-  - samples every 24th prediction,
-  - opens at most **one position at a time**,
-  - holds it for the full 24-hour period.
-
-**Impact on results**
-
-- **Classification metrics** (3-class and UP-vs-REST) are *unchanged* by this change (the model and its outputs are the same).
-- **Trading metrics** become much more realistic:
-
-  - Validation cumulative return dropped from “×72” to around **+15–20%**,  
-  - Test cumulative return around **+10%**,  
-  - Sharpe ratios in the **0.3–0.6** range instead of enormous values.
-
-This step did **not improve predictive skill**, but it was crucial to ensure that:
-
-> Trading performance is measured under **non-overlapping, one-trade-per-day behaviour**, directly comparable to daily experiments.
-
----
-
-### 4.3 Phase 3 – Mild Regularisation & Shorter Training
-
-**Observation**
-
-Even with hourly data and fixed trading:
-
-- Train F1 kept climbing to ~0.79,
-- Val F1 hovered around **0.33–0.36**,
-- Val loss rose above **2.0**,
-
-which is classic **overfitting**. The best model (by val macro-F1) was around epochs 10–16, but the curves looked ugly and I was wasting epochs.
-
-**Changes**
-
-In `config.py`:
-
-- Increase model dropout:
-
-  - `dropout: 0.2` (was `0.1`)
-
-- Increase weight decay:
-
-  - `weight_decay: 1e-4` (was `1e-5`)
-
-- Reduce epochs:
-
-  - `num_epochs: 12` (was `20`)
-
-No architecture changes were made; this was purely a **regularisation / training-schedule cleanup**.
-
-**Behaviour with new config**
-
-- Train F1 still increases steadily, but only up to ~0.65 at epoch 12.
-- Val F1 peaks earlier (~epoch 5) at **0.40** and then gradually decays.
-- Because I already save the **best validation macro-F1** checkpoint, the effective model used for evaluation is the epoch-5 one, which sits **before** the curves diverge too much.
+- On the validation year, the on-chain TFT delivers a much stronger risk-adjusted return.
+- On the test year, neither model is clearly profitable, but:
+  - Losses shrink (−11.6% → −4.0%),
+  - The hit ratio nearly doubles,
+  - Sharpe improves from clearly negative to roughly flat.
 
 ---
 
-## 5. Final Results (Experiment 6 – Hourly, Non-Overlapping, Regularised)
+## 5. Conclusion
 
-All numbers below refer to the **final configuration**:
+Experiment 7 extends the hourly 24h-ahead TFT from Experiment 6 by adding a small, carefully engineered on-chain feature set (active addresses, transactions, MVRV, SOPR, hash rate) while keeping everything else constant.
 
-- 1h data, 96-hour input window, 24h-ahead 3-class log-return label,
-- non-overlapping 24h trades,
-- dropout 0.2, weight decay 1e-4, 12 epochs.
+Main conclusions:
 
-### 5.1 3-Class Direction Metrics
+- For the **3-class direction classification task**, on-chain data does not change the big picture:
+  - macro-F1 and macro-AUC remain modest and close to Experiment 6.
+- For the **binary UP-vs-REST view and trading**, on-chain data does help:
+  - better recall and F1 for the UP class,
+  - slightly higher balanced accuracy and AUC,
+  - better trading metrics (especially on validation, and less negative on test).
 
-**Validation (2024)**
+Experiment 7 is therefore adopted as the new **“technical + on-chain hourly TFT baseline”**, and serves as the starting point for follow-up tuning experiments (e.g. Experiment 7b: model size, regularisation, VSN on/off, threshold grids) aimed at further improving robustness and trading usefulness.
 
-- Cross-entropy loss: **1.13**
-- Accuracy: **0.43**
-- Macro precision: **0.43**
-- Macro recall: **0.40**
-- **Macro-F1: 0.40**
-- **Macro-AUC: 0.57**
-
-**Test (2025)**
-
-- Cross-entropy loss: **1.20**
-- Accuracy: **0.39**
-- Macro precision: **0.39**
-- Macro recall: **0.37**
-- **Macro-F1: 0.36**
-- **Macro-AUC: 0.55**
-
-Compared to the daily Experiment-5 baseline (1-day ahead on daily candles):
-
-- Exp. 5 (daily): test macro-F1 ≈ **0.37**, macro-AUC ≈ **0.55**. :contentReference[oaicite:3]{index=3}  
-- Exp. 6 (hourly): test macro-F1 ≈ **0.36**, macro-AUC ≈ **0.55**.
-
-So **predictive power is essentially the same**; hourly data does not significantly improve the ability to distinguish DOWN / FLAT / UP.
-
-### 5.2 UP-vs-REST (Binary) Metrics
-
-I convert the 3 classes to a binary label:
-
-- Positive: `UP`
-- Negative: `{DOWN, FLAT}`
-
-On the validation set, I sweep thresholds on `P(UP)`:
-
-\[
-\tau \in \{0.10, 0.20, 0.30, 0.40, 0.50\}
-\]
-
-and select the one that **maximises balanced accuracy**. For this run:
-
-- Best threshold: **τ\* = 0.40**.
-- This is more conservative than the daily experiments (where τ\* often collapsed towards 0.10).
-
-**Validation (τ\* = 0.40)**
-
-- Accuracy: **0.57**
-- Balanced accuracy: **0.55**
-- Precision (UP): **0.48**
-- Recall (UP): **0.40**
-- F1 (UP): **0.44**
-- Macro-F1 (binary): **0.54**
-- AUC (UP vs REST): **0.55**
-- Positive rate: **0.35** (model trades on ~35% of samples)
-
-**Test (τ\* = 0.40)**
-
-- Accuracy: **0.56**
-- Balanced accuracy: **0.50**
-- Precision (UP): **0.38**
-- Recall (UP): **0.24**
-- F1 (UP): **0.29**
-- Macro-F1 (binary): **0.49**
-- AUC (UP vs REST): **0.51**
-- Positive rate: **0.24**
-
-Compared to the earlier hourly run (smaller regularisation, τ\* ≈ 0.50), this configuration:
-
-- **Improves UP-class F1** on test (from ~0.24 → ~0.29),
-- Uses a **more active** trading threshold (positive rate ~24% instead of ~15%),
-- Still delivers only **near-random AUC (~0.51)**, so ranking quality remains weak.
-
-### 5.3 Non-Overlapping 24h Trading Metrics
-
-Using τ\* = 0.40 and **non-overlapping trades**:
-
-- For each 24h block I either:
-  - **enter long BTC for the next 24 hours** if P(UP) ≥ τ\*, or  
-  - stay **flat**.
-
-**Validation (2024)**
-
-- Average daily return: **0.00063** (~0.06% / day)
-- Cumulative return (year): **+18.9%**
-- Sharpe ratio: **0.57**
-- Hit ratio (positive days while in position): **0.18**
-- Average return when in position: **0.00195**
-
-**Test (2025)**
-
-- Average daily return: **−0.00031** (~−0.03% / day)
-- Cumulative return: **−11.6%**
-- Sharpe ratio: **−0.45**
-- Hit ratio: **0.096**
-- Average return when in position: **−0.00151**
-
-Interpretation:
-
-- The strategy is in the market roughly **a quarter of the time** (positive_rate ≈ 0.24).
-- Performance is **not consistently positive**: mildly profitable on the 2024 validation year, but negative in 2025.
-- Given the weak AUC, these results are consistent with **no reliable edge** beyond noise and regime differences.
-
----
-
-## 6. Summary & Role as Baseline
-
-Experiment 6 achieved three things:
-
-1. **Hourly data and 24h horizons**  
-   - I verified that a TFT can be trained and evaluated on **1h BTC data** with a **24h-ahead log-return label** using the same architecture as the daily experiments.
-   - The model’s **predictive skill (macro-F1, AUC)** is **very similar** to the daily baseline; hourly data did **not** unlock a large edge.
-
-2. **Correct trading evaluation for 24h horizons**  
-   - I identified and fixed a subtle but important issue: overlapping 24h trades on hourly data.
-   - The new `NON_OVERLAPPING_TRADES` option enforces **one position per 24h horizon**, making trading metrics comparable across frequencies and horizons.
-
-3. **Cleaner regularised training**  
-   - Increasing dropout and weight decay and reducing the max epoch count gave a **more reasonable training curve** (less obvious runaway overfitting).
-   - Validation metrics improved slightly (val macro-F1 from ~0.36 → ~0.40) without changing test metrics dramatically.
-   - This configuration is now a **sensible, cost-effective default** for future TFT experiments.
-
-### Final conclusion
-
-- **Experiment 5 (daily)** remains an important reference, but  
-- the **final version of Experiment 6**—hourly data, 24h-ahead 3-class log-return direction, non-overlapping trades, and mild regularisation—is the **preferred TFT baseline** for subsequent work in this project.
-
-Future experiments (e.g. class-weighted loss, richer features, multi-horizon outputs, or alternative targets) will be built on top of this **hourly Experiment-6 setup** unless explicitly stated otherwise.

@@ -23,7 +23,7 @@ from typing import List
 # 1. DATA PATHS
 # ============================
 
-# Folder that contains this experiment (…/project_root/experiment_7)
+# Folder that contains this experiment (…/project_root/experiment_7b)
 EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Top-level project folder one level above (…/project_root)
@@ -232,19 +232,19 @@ class ModelConfig:
     input_size: int = len(FEATURE_COLS)
 
     # Shared hidden size for LSTM, attention and feed-forward blocks
-    hidden_size: int = 64
+    hidden_size: int = 32
 
     # Number of stacked LSTM layers
     lstm_layers: int = 1
 
     # Dropout applied in LSTM, attention and feed-forward blocks
-    dropout: float = 0.2
+    dropout: float = 0.3
 
     # Number of attention heads in the multi-head self-attention block
     num_heads: int = 4
 
     # Hidden size of the position-wise feed-forward network
-    ff_hidden_size: int = 128
+    ff_hidden_size: int = 64
 
     # -------- Advanced TFT-style options --------
 
@@ -258,7 +258,7 @@ class ModelConfig:
     use_future_covariates: bool = True
 
     # Hidden size used inside variable selection networks (VSNs) and GRNs.
-    variable_selection_hidden_size: int = 64
+    variable_selection_hidden_size: int = 32
 
     # Hidden size for potential static covariate encoders (multi-asset extension).
     static_hidden_size: int = 16
@@ -303,7 +303,7 @@ class TrainingConfig:
     batch_size: int = 64
     num_epochs: int = 12
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-4
 
     # If pos_weight == 1 -> no reweighting (standard CE).
     # Only used when TASK_TYPE == "classification".
@@ -362,10 +362,10 @@ THRESHOLD_TARGET_METRIC: str = "f1"
 # ----------------------------
 # Experiment 5c-style: UP-vs-REST threshold grid
 # ----------------------------
-UP_THRESHOLD_GRID: List[float] = [0.10, 0.20, 0.30, 0.40, 0.50]
+UP_THRESHOLD_GRID = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
 
 # Metric to use when selecting τ* from UP_THRESHOLD_GRID on the validation set.
-THRESHOLD_SELECTION_METRIC: str = "balanced_accuracy"
+THRESHOLD_SELECTION_METRIC: str = "sharpe"
 
 # ----------------------------
 # Trading / evaluation options

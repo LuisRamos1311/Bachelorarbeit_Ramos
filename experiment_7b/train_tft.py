@@ -35,7 +35,7 @@ from typing import Dict, Tuple, Optional
 import torch
 from torch.utils.data import DataLoader
 
-from experiment_7.config import (
+from experiment_7b.config import (
     MODEL_CONFIG,
     TRAINING_CONFIG,
     MODELS_DIR,
@@ -53,9 +53,9 @@ from experiment_7.config import (
     FEATURE_COLS,
     ONCHAIN_COLS,
 )
-from experiment_7.data_pipeline import prepare_datasets
-from experiment_7.tft_model import TemporalFusionTransformer
-from experiment_7 import utils
+from experiment_7b.data_pipeline import prepare_datasets
+from experiment_7b.tft_model import TemporalFusionTransformer
+from experiment_7b import utils
 
 
 # ============================================================
