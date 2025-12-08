@@ -13,7 +13,7 @@ This file groups together:
 Other modules (data_pipeline.py, train_tft.py, tft_model.py, etc.)
 should import from here instead of hardcoding values.
 
-Experiment 6:
+Experiment_7:
 - 1-hour BTC candles
 - SEQ_LENGTH in hours (e.g. 96 = 4 days of history)
 - FORECAST_HORIZONS in steps (e.g. [24] = next 24 hours)
@@ -28,7 +28,7 @@ from typing import List
 # 1. DATA PATHS
 # ============================
 
-# Folder that contains this experiment (…/project_root/experiment_6)
+# Folder that contains this experiment (…/project_root/experiment_7)
 EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Top-level project folder one level above (…/project_root)
