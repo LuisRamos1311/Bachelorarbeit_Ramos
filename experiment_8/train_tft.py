@@ -52,6 +52,9 @@ from experiment_8.config import (
     BEST_MODEL_PATH,
     FEATURE_COLS,
     ONCHAIN_COLS,
+    USE_ONCHAIN,
+    USE_SENTIMENT,
+    SENTIMENT_COLS,
 )
 from experiment_8.data_pipeline import prepare_datasets
 from experiment_8.tft_model import TemporalFusionTransformer
@@ -246,6 +249,9 @@ def main() -> None:
         horizon_desc = f"{horizon_steps}-step-ahead"
 
     # Print a short experiment summary so logs are self-documenting
+    onchain_count = len(ONCHAIN_COLS) if USE_ONCHAIN else 0
+    sentiment_count = len(SENTIMENT_COLS) if USE_SENTIMENT else 0
+
     print(
         f"[train_tft] Experiment setup: {horizon_desc} "
         f"{NUM_CLASSES}-class direction "
@@ -254,7 +260,8 @@ def main() -> None:
         f"use_log_returns={USE_LOG_RETURNS}, "
         f"seq_length={SEQ_LENGTH}, "
         f"frequency='{FREQUENCY}', "
-        f"features={len(FEATURE_COLS)} (incl. {len(ONCHAIN_COLS)} on-chain)"
+        f"features={len(FEATURE_COLS)} "
+        f"(incl. {onchain_count} on-chain, {sentiment_count} sentiment)"
     )
 
     # 1) Prepare datasets (explicitly pass SEQ_LENGTH to keep training/eval aligned)

@@ -53,16 +53,15 @@ BTC_ONCHAIN_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_onchain_daily.csv")
 # 2. DATE RANGES
 # ============================
 
-# For Experiment 6 the range was adjusted as the earliest available hourly data is from 2018
 # Adjust these if your BTCUSD_hourly.csv covers a different period.
-TRAIN_START_DATE = "2018-05-15"   # first available hourly bar
-TRAIN_END_DATE   = "2023-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear, 2023 chop
+TRAIN_START_DATE = "2016-01-01"   # first available hourly bar
+TRAIN_END_DATE   = "2022-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
 
-VAL_START_DATE   = "2024-01-01"   # recent but separate for tuning / threshold selection
-VAL_END_DATE     = "2024-12-31"
+VAL_START_DATE   = "2023-01-01"   # recent but separate for tuning / threshold selection
+VAL_END_DATE     = "2023-12-31"
 
-TEST_START_DATE  = "2025-01-01"   # most recent, fully out-of-sample regime
-TEST_END_DATE    = "2025-12-31"   # or last available 2025 timestamp
+TEST_START_DATE  = "2024-01-01"   # most recent, fully out-of-sample regime
+TEST_END_DATE    = "2024-12-31"   # or last available 2024 timestamp
 
 
 # ============================

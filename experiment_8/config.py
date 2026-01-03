@@ -49,20 +49,24 @@ FREQUENCY: str = "1h"  # "D" for daily, "1h" for hourly, etc.
 # On-chain daily CSV for Experiment 7
 BTC_ONCHAIN_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_onchain_daily.csv")
 
+# Sentiment daily CSV for Experiment 8 (combined Reddit + Fear & Greed)
+# Combined daily sentiment (Reddit Pushshift + Fear & Greed engineered features), fully contiguous daily grid; no NaNs.
+BTC_SENTIMENT_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_sentiment_daily.csv")
+
+
 # ============================
 # 2. DATE RANGES
 # ============================
 
-# For Experiment 6 the range was adjusted as the earliest available hourly data is from 2018
 # Adjust these if your BTCUSD_hourly.csv covers a different period.
-TRAIN_START_DATE = "2018-05-15"   # first available hourly bar
-TRAIN_END_DATE   = "2023-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear, 2023 chop
+TRAIN_START_DATE = "2016-01-01"   # first available hourly bar
+TRAIN_END_DATE   = "2022-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
 
-VAL_START_DATE   = "2024-01-01"   # recent but separate for tuning / threshold selection
-VAL_END_DATE     = "2024-12-31"
+VAL_START_DATE   = "2023-01-01"   # recent but separate for tuning / threshold selection
+VAL_END_DATE     = "2023-12-31"
 
-TEST_START_DATE  = "2025-01-01"   # most recent, fully out-of-sample regime
-TEST_END_DATE    = "2025-12-31"   # or last available 2025 timestamp
+TEST_START_DATE  = "2024-01-01"   # most recent, fully out-of-sample regime
+TEST_END_DATE    = "2024-12-31"   # or last available 2024 timestamp
 
 
 # ============================
@@ -146,20 +150,37 @@ ONCHAIN_COLS: List[str] = [
     "hash_ma_ratio",
 ]
 
-USE_ONCHAIN: bool = True  # Experiment 7: include on-chain features
+USE_ONCHAIN: bool = True  # Experiment 7/8: include on-chain features
+
+# Sentiment feature columns (Experiment 8)
+USE_SENTIMENT: bool = True
+SENTIMENT_COLS: List[str] = [
+    # Reddit (Pushshift daily)
+    "reddit_sent_mean",
+    "reddit_sent_std",
+    "reddit_pos_ratio",
+    "reddit_neg_ratio",
+    "reddit_volume_log",
+
+    # Fear & Greed (engineered daily)
+    "fg_index_scaled",
+    "fg_change_1d",
+    "fg_missing",
+]
+
+# Columns that are binary indicators and should NOT be standardized.
+# Keep them as 0/1 so the model can interpret them cleanly.
+BINARY_COLS: List[str] = [
+    "fg_missing",
+]
 
 # Full list of feature columns fed into the model as PAST covariates
-FEATURE_COLS: List[str] = PRICE_VOLUME_COLS + INDICATOR_COLS + ONCHAIN_COLS
-
-# (For the future) additional sentiment feature columns
-USE_SENTIMENT: bool = False
-SENTIMENT_COLS: List[str] = [
-    # Example placeholders:
-    # "sentiment_mean",
-    # "sentiment_pos",
-    # "sentiment_neg",
-    # Fill these in when you implement sentiment_features.py
-]
+FEATURE_COLS: List[str] = (
+    PRICE_VOLUME_COLS
+    + INDICATOR_COLS
+    + (ONCHAIN_COLS if USE_ONCHAIN else [])
+    + (SENTIMENT_COLS if USE_SENTIMENT else [])
+)
 
 # -------- Calendar & halving features (base + future) --------
 # Base calendar features – attached to each timestamp t.

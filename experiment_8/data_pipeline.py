@@ -276,6 +276,116 @@ def add_onchain_features(hourly_df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def load_sentiment_daily(csv_path: str | None = None) -> pd.DataFrame:
+    """
+    Load the combined daily sentiment dataset (Reddit Pushshift + Fear & Greed)
+    and return a DataFrame indexed by daily dates.
+
+    Expected columns (besides 'date') are config.SENTIMENT_COLS, e.g.:
+        - reddit_sent_mean, reddit_sent_std, reddit_pos_ratio, reddit_neg_ratio,
+          reddit_volume, reddit_volume_log,
+        - fg_index_scaled, fg_change_1d, fg_missing
+
+    The file should be on a fully contiguous daily date grid and should not
+    contain NaNs inside the intended experiment window.
+    """
+    if csv_path is None:
+        csv_path = config.BTC_SENTIMENT_DAILY_CSV_PATH
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Sentiment CSV not found at: {csv_path}\n"
+            f"Expected it under your data folder as BTC_sentiment_daily.csv."
+        )
+
+    df = pd.read_csv(csv_path)
+
+    if "date" not in df.columns:
+        raise ValueError("Sentiment CSV must contain a 'date' column.")
+
+    # Parse date, sort, set as index
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").set_index("date")
+
+    # Make sure it is daily-indexed; forward fill internal gaps if any
+    df = df.asfreq("D").ffill()
+
+    # Validate required columns exist
+    missing_cols = [c for c in config.SENTIMENT_COLS if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Sentiment CSV is missing required columns: {missing_cols}\n"
+            f"Check BTC_sentiment_daily.csv header vs config.SENTIMENT_COLS."
+        )
+
+    return df
+
+def add_sentiment_features(hourly_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge DAILY sentiment features into an HOURLY BTC dataframe.
+
+    Strategy:
+      1) Load daily sentiment features (index = daily dates).
+      2) Create a daily merge key for hourly timestamps: df.index.floor('D').
+      3) Left-join sentiment onto each hour.
+      4) Fill any remaining missing values with safe constants to prevent NaNs.
+
+    Note: Filling is done with neutral constants (no look-ahead), so it is safe.
+    """
+    if not isinstance(hourly_df.index, pd.DatetimeIndex):
+        raise TypeError("add_sentiment_features expects hourly_df with a DatetimeIndex.")
+
+    df = hourly_df.copy()
+
+    # Avoid ambiguity between index name and 'date' column (same pattern as on-chain)
+    if df.index.name == "date":
+        df.index.name = "timestamp"
+
+    sentiment_df = load_sentiment_daily()  # daily index
+
+    # Merge daily → hourly using a daily key
+    df["date"] = df.index.floor("D")
+
+    df = df.merge(
+        sentiment_df,
+        how="left",
+        left_on="date",
+        right_index=True,
+    )
+
+    df = df.drop(columns=["date"])
+
+    # --- Safety: fill any missing values with neutral constants ---
+    # (This prevents scaler/training crashes if there are any unexpected gaps.)
+    # Reddit defaults: "no activity / neutral"
+    reddit_defaults = {
+        "reddit_sent_mean": 0.0,
+        "reddit_sent_std": 0.0,
+        "reddit_pos_ratio": 0.0,
+        "reddit_neg_ratio": 0.0,
+        "reddit_volume": 0.0,
+        "reddit_volume_log": 0.0,
+    }
+
+    # Fear & Greed defaults: neutral level + explicit missingness
+    fg_defaults = {
+        "fg_index_scaled": 0.5,   # 50 scaled to 0.5
+        "fg_change_1d": 0.0,
+        "fg_missing": 1.0,
+    }
+
+    # Apply defaults only for columns that exist in your config
+    for col, default in {**reddit_defaults, **fg_defaults}.items():
+        if col in config.SENTIMENT_COLS and col in df.columns:
+            df[col] = df[col].fillna(default)
+
+    # If fg_missing exists, ensure it is 1 when fg_index_scaled was missing originally
+    # (Optional safety; harmless even if already correct.)
+    if "fg_missing" in config.SENTIMENT_COLS and "fg_missing" in df.columns:
+        df["fg_missing"] = df["fg_missing"].astype(float)
+
+    return df
+
 
 # ============================
 # 2. TECHNICAL INDICATORS
@@ -713,25 +823,60 @@ def scale_features(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
     """
     Scale features using:
-        - MinMaxScaler for price & volume columns
-        - StandardScaler for indicator columns
+        - MinMaxScaler for price & volume columns (config.PRICE_VOLUME_COLS)
+        - StandardScaler for all other continuous columns
+        - NO scaling for binary indicator columns (config.BINARY_COLS), e.g. fg_missing
 
     Returns:
         scaled_train_df, scaled_val_df, scaled_test_df, scalers_dict
     """
+    # 1) Split columns into groups
     price_volume_cols = [c for c in feature_cols if c in config.PRICE_VOLUME_COLS]
 
+    binary_cols_cfg = getattr(config, "BINARY_COLS", [])
+    binary_cols = [c for c in feature_cols if c in binary_cols_cfg]
+
+    # Everything that is not price/volume and not binary gets standardized
     indicator_like_cols = [
         c for c in feature_cols
-        if c not in price_volume_cols  # everything else -> StandardScaler
+        if c not in price_volume_cols and c not in binary_cols
     ]
-    # or explicit union of INDICATOR_COLS + ONCHAIN_COLS
 
+    # 2) Work on copies
     train_df = train_df.copy()
     val_df = val_df.copy()
     test_df = test_df.copy()
 
-    # --- Fit scalers on TRAIN only ---
+    # 3) Safety checks: fail early if NaN/Inf exists
+    def _assert_finite(df: pd.DataFrame, cols: List[str], split_name: str, stage: str) -> None:
+        if not cols:
+            return
+
+        # NaN check
+        nan_mask = df[cols].isna()
+        if nan_mask.any().any():
+            nan_cols = nan_mask.columns[nan_mask.any()].tolist()
+            raise ValueError(
+                f"[scale_features] Found NaNs in {split_name} {stage} for columns: {nan_cols}\n"
+                f"Common causes:\n"
+                f"  - Sentiment CSV does not cover the split date range\n"
+                f"  - On-chain merge left early years empty\n"
+                f"  - A feature column name mismatch between config and data\n"
+            )
+
+        # Inf check (also catches non-numeric values when converting)
+        arr = df[cols].to_numpy(dtype=float)
+        if not np.isfinite(arr).all():
+            raise ValueError(
+                f"[scale_features] Found Inf or non-finite values in {split_name} {stage}.\n"
+                f"Check your merged feature columns for extreme values or parsing issues."
+            )
+
+    _assert_finite(train_df, feature_cols, "TRAIN", "(before scaling)")
+    _assert_finite(val_df, feature_cols, "VAL", "(before scaling)")
+    _assert_finite(test_df, feature_cols, "TEST", "(before scaling)")
+
+    # 4) Fit scalers on TRAIN only
     pv_scaler = MinMaxScaler()
     ind_scaler = StandardScaler()
 
@@ -740,12 +885,18 @@ def scale_features(
     if indicator_like_cols:
         ind_scaler.fit(train_df[indicator_like_cols])
 
-    # --- Transform all splits ---
+    # 5) Transform all splits
     for df in (train_df, val_df, test_df):
         if price_volume_cols:
             df[price_volume_cols] = pv_scaler.transform(df[price_volume_cols])
         if indicator_like_cols:
             df[indicator_like_cols] = ind_scaler.transform(df[indicator_like_cols])
+        # binary_cols remain untouched (0/1)
+
+    # 6) Final checks after scaling
+    _assert_finite(train_df, feature_cols, "TRAIN", "(after scaling)")
+    _assert_finite(val_df, feature_cols, "VAL", "(after scaling)")
+    _assert_finite(test_df, feature_cols, "TEST", "(after scaling)")
 
     scalers = {
         "price_volume_scaler": pv_scaler,
@@ -753,6 +904,7 @@ def scale_features(
         "feature_cols": feature_cols,
         "price_volume_cols": price_volume_cols,
         "indicator_cols": indicator_like_cols,
+        "binary_cols": binary_cols,
     }
 
     return train_df, val_df, test_df, scalers
@@ -966,6 +1118,10 @@ def prepare_datasets(
     # Only do this when USE_ONCHAIN is True in config.py
     if getattr(config, "USE_ONCHAIN", False):
         df = add_onchain_features(df)
+
+    # 2.6 Add sentiment features (Experiment 8)
+    if getattr(config, "USE_SENTIMENT", False):
+        df = add_sentiment_features(df)
 
     # 3. Add calendar and halving features
     df = add_calendar_features(df)
