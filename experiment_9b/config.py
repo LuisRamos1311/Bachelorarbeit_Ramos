@@ -23,7 +23,7 @@ from typing import List
 # 1. DATA PATHS
 # ============================
 
-# Folder that contains this experiment (…/project_root/experiment_9)
+# Folder that contains this experiment (…/project_root/experiment_9b)
 EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Top-level project folder one level above (…/project_root)
@@ -388,3 +388,18 @@ THRESHOLD_SELECTION_METRIC: str = "sharpe"
 # For hourly data with H>1 (e.g. 24h horizon), use non-overlapping trades
 # when computing trading metrics (one trade per H-step block).
 NON_OVERLAPPING_TRADES: bool = True
+
+# ----------------------------
+# Experiment 9b: backtest assumptions (costs + annualization + baselines)
+# ----------------------------
+
+# Crypto trades 365 days/year, so Sharpe annualization should use 365 (not 252).
+TRADING_DAYS_PER_YEAR: int = 365
+
+# Transaction cost assumptions in basis points (bps). 1 bp = 0.01% = 0.0001.
+COST_BPS: float = 5.0
+SLIPPAGE_BPS: float = 2.0
+
+# Baseline sampling for random strategy comparisons.
+RANDOM_BASELINE_RUNS: int = 1000
+RANDOM_SEED: int = 42
