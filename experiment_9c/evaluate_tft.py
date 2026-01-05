@@ -938,16 +938,41 @@ def main() -> None:
             mu_test_tr = mu_test
 
         # --- Threshold sweep over SCORE (select τ* on val by ACTIVE_SELECTION_METRIC) ---
-        threshold_grid: list[float] = list(getattr(cfg, "ACTIVE_THRESHOLD_GRID", ACTIVE_THRESHOLD_GRID)) \
-            or list(getattr(cfg, "SCORE_GRID", SCORE_GRID)) \
-            or [float(EVAL_THRESHOLD)]
+        # Build threshold grid (absolute or percentile-based)
+        grid_mode = str(getattr(cfg, "ACTIVE_THRESHOLD_GRID_MODE", "absolute")).lower().strip()
+
+        raw_grid = list(getattr(cfg, "ACTIVE_THRESHOLD_GRID", ACTIVE_THRESHOLD_GRID)) \
+                   or list(getattr(cfg, "SCORE_GRID", SCORE_GRID)) \
+                   or [float(EVAL_THRESHOLD)]
+
+        if grid_mode in ("percentile", "percentiles", "pct", "pctl", "quantile", "quantiles"):
+            # raw_grid contains percentiles in [0.0, 1.0]
+            percentiles = np.array(raw_grid, dtype=float)
+            percentiles = np.clip(percentiles, 0.0, 1.0)
+
+            # IMPORTANT: use the same validation scores you actually trade on (non-overlapping)
+            finite_scores = np.asarray(score_val_tr, dtype=float)
+            finite_scores = finite_scores[np.isfinite(finite_scores)]
+
+            threshold_vals = np.quantile(finite_scores, percentiles)
+
+            # de-duplicate + sort (quantiles can coincide if distribution is tight)
+            threshold_grid = sorted(set(float(x) for x in threshold_vals))
+        else:
+            # raw_grid already contains literal threshold values
+            threshold_grid = [float(x) for x in raw_grid]
 
         selection_metric = str(getattr(cfg, "ACTIVE_SELECTION_METRIC", ACTIVE_SELECTION_METRIC))
         auto_tune = bool(getattr(cfg, "ACTIVE_AUTO_TUNE", ACTIVE_AUTO_TUNE))
         selection_key = selection_metric.lower().strip()
 
         print("[evaluate_tft] Threshold sweep on score = mu/(iqr+eps) for LONG-only:")
-        print(f"  Grid: {threshold_grid}")
+        print(f"  Grid mode: {grid_mode}")
+        if grid_mode in ("percentile", "percentiles", "pct", "pctl", "quantile", "quantiles"):
+            print(f"  Percentiles: {raw_grid}")
+            print(f"  Thresholds:  {threshold_grid}")
+        else:
+            print(f"  Grid: {threshold_grid}")
         print(f"  Selection metric (val): {selection_metric}")
         print(f"  AUTO_TUNE_THRESHOLD   : {auto_tune}")
         print(f"  Score quantile idx: {q_idx}  (mu=q50, iqr=q90-q10)")

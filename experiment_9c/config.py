@@ -378,6 +378,15 @@ SIGNAL_HORIZON: int = FORECAST_HORIZON     # which step you trade on (use 24 fir
 SCORE_EPS: float = 1e-6                    # for mu/(iqr+eps)
 SCORE_GRID = [0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.045, 0.050, 0.055]
 
+# Percentile grid for score thresholds (values must be between 0.0 and 1.0)
+# Example: 0.90 means “threshold is the 90th percentile of validation scores”
+SCORE_PERCENTILE_GRID = [0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+
+# Choose how thresholds are interpreted in quantile mode:
+#   "absolute"   -> use SCORE_GRID values directly
+#   "percentile" -> convert SCORE_PERCENTILE_GRID into real thresholds using validation score percentiles
+SCORE_THRESHOLD_MODE: str = "percentile"
+
 # ----------------------------
 # ACTIVE signal-threshold settings (foolproof)
 # ----------------------------
@@ -391,7 +400,8 @@ if TASK_TYPE == "classification":
     ACTIVE_AUTO_TUNE: bool = AUTO_TUNE_THRESHOLD
 elif TASK_TYPE == "quantile_forecast":
     ACTIVE_SIGNAL_NAME: str = "score"
-    ACTIVE_THRESHOLD_GRID = SCORE_GRID
+    ACTIVE_THRESHOLD_GRID_MODE: str = SCORE_THRESHOLD_MODE
+    ACTIVE_THRESHOLD_GRID = SCORE_PERCENTILE_GRID if SCORE_THRESHOLD_MODE == "percentile" else SCORE_GRID
     ACTIVE_SELECTION_METRIC: str = "sharpe"  # keep consistent with your outline
     ACTIVE_AUTO_TUNE: bool = True
 else:
@@ -401,7 +411,10 @@ if TASK_TYPE == "quantile_forecast":
     # Guardrail: if someone accidentally tries to use classification-only thresholding
     # in quantile mode, they should notice immediately.
     assert ACTIVE_SIGNAL_NAME == "score"
-    assert ACTIVE_THRESHOLD_GRID == SCORE_GRID
+    if SCORE_THRESHOLD_MODE == "percentile":
+        assert ACTIVE_THRESHOLD_GRID == SCORE_PERCENTILE_GRID
+    else:
+        assert ACTIVE_THRESHOLD_GRID == SCORE_GRID
 
 # ----------------------------
 # Trading / evaluation options
