@@ -14,16 +14,6 @@ Experiment configuration:
         * log(close_{t+H} / close_t)      if config.USE_LOG_RETURNS = True
         * close_{t+H} / close_t - 1.0     otherwise
     (see data_pipeline.add_target_column).
-
-Currently, only the multi-class classification path is implemented:
-  - TASK_TYPE = "classification"
-  - Loss: CrossEntropyLoss on 3 classes (DOWN / FLAT / UP)
-  - Metrics: utils.compute_multiclass_metrics (macro-averaged)
-  - Model selection: best validation macro-F1 ("f1" from compute_multiclass_metrics)
-
-The code is written so that later you can extend it to:
-  - multi-horizon regression or classification (by adding branches to
-    run_epoch() and main(), and using config.FORECAST_HORIZONS).
 """
 
 from __future__ import annotations
@@ -35,7 +25,7 @@ from typing import Dict, Tuple, Optional
 import torch
 from torch.utils.data import DataLoader
 
-from experiment_9b.config import (
+from experiment_9c.config import (
     MODEL_CONFIG,
     TRAINING_CONFIG,
     MODELS_DIR,
@@ -55,11 +45,13 @@ from experiment_9b.config import (
     USE_ONCHAIN,
     USE_SENTIMENT,
     SENTIMENT_COLS,
+    FORECAST_HORIZON,
+    QUANTILES,
 )
-from experiment_9b import config as cfg
-from experiment_9b.data_pipeline import prepare_datasets
-from experiment_9b.tft_model import TemporalFusionTransformer
-from experiment_9b import utils
+from experiment_9c import config as cfg
+from experiment_9c.data_pipeline import prepare_datasets
+from experiment_9c.tft_model import TemporalFusionTransformer
+from experiment_9c import utils
 
 
 # ============================================================
@@ -101,7 +93,7 @@ def run_epoch(
     model: torch.nn.Module,
     data_loader: DataLoader,
     device: torch.device,
-    criterion: torch.nn.Module,
+    criterion: Optional[torch.nn.Module],
     optimizer: Optional[torch.optim.Optimizer] = None,
     train: bool = True,
     threshold: float = 0.5,
@@ -109,36 +101,20 @@ def run_epoch(
     """
     Run one epoch over a DataLoader, for either training or validation.
 
-    Args:
-        model:
-            The Temporal Fusion Transformer model.
-        data_loader:
-            DataLoader yielding (X_past, y) or (X_past, X_future, y).
-        device:
-            Torch device.
-        criterion:
-            Loss function:
-              - CrossEntropyLoss for multi-class classification.
-        optimizer:
-            Optimizer (only required if train=True).
-        train:
-            If True, run in training mode and update weights.
-            If False, run in eval mode and do not update weights.
-        threshold:
-            Currently unused for multi-class, kept for future UP-vs-REST or
-            binary tasks (so the signature is stable).
-
     Returns:
-        Dict of metrics, always including a "loss" key. For classification,
-        this also contains:
-            "accuracy", "precision", "recall", "f1", "auc"
+        Dict of metrics, always including "loss".
+        - classification: also includes accuracy/precision/recall/f1/auc
+        - quantile_forecast: also includes mae (median @ FORECAST_HORIZON)
     """
     if train:
+        if optimizer is None:
+            raise ValueError("optimizer must be provided when train=True")
         model.train()
     else:
         model.eval()
 
     total_loss = 0.0
+    total_mae = 0.0  # only used for quantile_forecast
     num_samples = 0
 
     all_true = []
@@ -166,7 +142,9 @@ def run_epoch(
         with torch.set_grad_enabled(train):
             # Forward
             if TASK_TYPE == "classification":
-                # logits shape: (batch_size, NUM_CLASSES)
+                if criterion is None:
+                    raise ValueError("criterion must not be None for classification")
+
                 if x_future is not None:
                     logits = model(x_past, x_future)
                 else:
@@ -175,6 +153,31 @@ def run_epoch(
                 loss = criterion(logits, y)
                 out_for_metrics = logits
                 y_for_metrics = y
+
+            elif TASK_TYPE == "quantile_forecast":
+                # y_hat shape: (B, H, Q)
+                if x_future is not None:
+                    y_hat = model(x_past, x_future)
+                else:
+                    y_hat = model(x_past)
+
+                loss = utils.pinball_loss(
+                    y_true=y,
+                    y_pred=y_hat,
+                    quantiles=QUANTILES,
+                )
+
+                # MAE on q=0.5 at horizon FORECAST_HORIZON (e.g. 24)
+                batch_mae = utils.mae_on_median_at_horizon(
+                    y_true=y,
+                    y_pred=y_hat,
+                    quantiles=QUANTILES,
+                    horizon_step=FORECAST_HORIZON,
+                )
+
+                out_for_metrics = y_hat
+                y_for_metrics = y
+
             else:
                 raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
 
@@ -190,36 +193,42 @@ def run_epoch(
                 optimizer.step()
 
         # Accumulate loss and predictions
-        batch_size = y.size(0)  # number of samples in batch
+        batch_size = y.size(0)
         total_loss += loss.item() * batch_size
         num_samples += batch_size
 
-        all_true.append(y_for_metrics.detach().cpu())
-        all_outputs.append(out_for_metrics.detach().cpu())
+        if TASK_TYPE == "quantile_forecast":
+            total_mae += float(batch_mae) * batch_size
+        else:
+            all_true.append(y_for_metrics.detach().cpu())
+            all_outputs.append(out_for_metrics.detach().cpu())
 
     if num_samples == 0:
         raise RuntimeError("DataLoader has zero samples in run_epoch().")
-
-    # Concatenate along batch dimension:
-    #   classification: (N,)
-    y_true_all = torch.cat(all_true, dim=0)
-    y_out_all = torch.cat(all_outputs, dim=0)
 
     avg_loss = total_loss / num_samples
 
     # ---- Metrics depending on task type ----
     if TASK_TYPE == "classification":
-        # Convert logits -> class probabilities
+        y_true_all = torch.cat(all_true, dim=0)
+        y_out_all = torch.cat(all_outputs, dim=0)
         y_prob = torch.softmax(y_out_all, dim=1)
+
         metrics = utils.compute_multiclass_metrics(
             y_true=y_true_all,
             y_prob=y_prob,
         )
         metrics["loss"] = float(avg_loss)
-    else:
-        raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
+        return metrics
 
-    return metrics
+    if TASK_TYPE == "quantile_forecast":
+        avg_mae = total_mae / num_samples
+        return {
+            "loss": float(avg_loss),  # pinball
+            "mae": float(avg_mae),    # MAE on median @ H
+        }
+
+    raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in run_epoch().")
 
 
 # ============================================================
@@ -253,17 +262,33 @@ def main() -> None:
     onchain_count = len(ONCHAIN_COLS) if USE_ONCHAIN else 0
     sentiment_count = len(SENTIMENT_COLS) if USE_SENTIMENT else 0
 
-    print(
-        f"[train_tft] Experiment setup: {horizon_desc} "
-        f"{NUM_CLASSES}-class direction "
-        f"label='{DIRECTION_LABEL_COLUMN}', "
-        f"threshold={DIRECTION_THRESHOLD:.4f}, "
-        f"use_log_returns={USE_LOG_RETURNS}, "
-        f"seq_length={SEQ_LENGTH}, "
-        f"frequency='{FREQUENCY}', "
-        f"features={len(FEATURE_COLS)} "
-        f"(incl. {onchain_count} on-chain, {sentiment_count} sentiment)"
-    )
+    out_size = FORECAST_HORIZON * len(QUANTILES)
+
+    if TASK_TYPE == "classification":
+        print(
+            f"[train_tft] Experiment setup: {horizon_desc} "
+            f"{NUM_CLASSES}-class direction "
+            f"label='{DIRECTION_LABEL_COLUMN}', "
+            f"threshold={DIRECTION_THRESHOLD:.4f}, "
+            f"use_log_returns={USE_LOG_RETURNS}, "
+            f"seq_length={SEQ_LENGTH}, "
+            f"frequency='{FREQUENCY}', "
+            f"features={len(FEATURE_COLS)} "
+            f"(incl. {onchain_count} on-chain, {sentiment_count} sentiment)"
+        )
+    elif TASK_TYPE == "quantile_forecast":
+        print(
+            f"[train_tft] Experiment setup: {horizon_desc} quantile multi-horizon "
+            f"H={FORECAST_HORIZON}, QUANTILES={list(QUANTILES)}, "
+            f"use_log_returns={USE_LOG_RETURNS}, "
+            f"seq_length={SEQ_LENGTH}, "
+            f"frequency='{FREQUENCY}', "
+            f"features={len(FEATURE_COLS)} "
+            f"(incl. {onchain_count} on-chain, {sentiment_count} sentiment), "
+            f"output_size={out_size}"
+        )
+    else:
+        raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
     # Experiment 9a: data integrity flags (self-documenting logs)
     print("[train_tft] Integrity flags (Experiment 9a):")
@@ -295,12 +320,16 @@ def main() -> None:
 
     # 4) Loss function
     if TASK_TYPE == "classification":
-        # Multi-class (0=DOWN, 1=FLAT, 2=UP)
-        # You can later add class weights here if needed.
         criterion = torch.nn.CrossEntropyLoss()
         print(
             f"[train_tft] Using CrossEntropyLoss for "
             f"{NUM_CLASSES}-class classification."
+        )
+    elif TASK_TYPE == "quantile_forecast":
+        criterion = None  # pinball loss computed inside run_epoch()
+        print(
+            f"[train_tft] Using pinball loss for quantile forecasting "
+            f"(H={FORECAST_HORIZON}, QUANTILES={list(QUANTILES)})."
         )
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
@@ -340,11 +369,23 @@ def main() -> None:
                 "val_auc": [],
             }
         )
-        # "f1" here is macro-F1 from utils.compute_multiclass_metrics
         selection_metric_name = "f1"
         best_val_metric = -1.0
         selection_mode = "max"
         print("[train_tft] Model selection metric: Val macro-F1 (maximize).")
+
+    elif TASK_TYPE == "quantile_forecast":
+        history.update(
+            {
+                "train_mae": [],
+                "val_mae": [],
+            }
+        )
+        selection_metric_name = "loss"  # pinball loss
+        best_val_metric = float("inf")
+        selection_mode = "min"
+        print("[train_tft] Model selection metric: Val pinball loss (minimize).")
+
     else:
         raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
@@ -406,6 +447,21 @@ def main() -> None:
                 f"Val F1={val_metrics['f1']:.4f}, "
                 f"Val Acc={val_metrics['accuracy']:.4f}"
             )
+
+        elif TASK_TYPE == "quantile_forecast":
+            history["train_mae"].append(train_metrics["mae"])
+            history["val_mae"].append(val_metrics["mae"])
+
+            print(
+                f"[train_tft][Epoch {epoch}] "
+                f"Train pinball={train_metrics['loss']:.4f}, "
+                f"Val pinball={val_metrics['loss']:.4f}, "
+                f"Train MAE@{FORECAST_HORIZON}={train_metrics['mae']:.6f}, "
+                f"Val MAE@{FORECAST_HORIZON}={val_metrics['mae']:.6f}"
+            )
+
+        else:
+            raise ValueError(f"Unsupported TASK_TYPE='{TASK_TYPE}' in train_tft.")
 
         # --- Model selection ---
         current_val_metric = val_metrics[selection_metric_name]

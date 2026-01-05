@@ -4,12 +4,9 @@ evaluate_tft.py
 Evaluate a trained Temporal Fusion Transformer (TFT) model on the BTC dataset.
 
 Experiment / generic single-horizon setup:
-    - TASK_TYPE = "classification"  (3-class DOWN / FLAT / UP via direction_3c)
-    - Single-horizon H-step-ahead prediction where
-          H = FORECAST_HORIZONS[0]
-      e.g. for Experiment 6 with hourly data:
-          FREQUENCY = "1h", FORECAST_HORIZONS = [24]
-          -> "next 24 hours" direction.
+evaluation supports:
+classification (old path)
+quantile multi-horizon forecasting (new 9c path): pinball loss, MAE@trade horizon, and score-based threshold sweep.
 
     - UP-vs-REST analysis with:
         * Manual threshold sweep over a fixed grid for P(UP)
@@ -38,37 +35,57 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from experiment_9b.config import (
+from experiment_9c.config import (
+    # Model + training
     MODEL_CONFIG,
     TRAINING_CONFIG,
     TASK_TYPE,
-    EVAL_THRESHOLD,
-    AUTO_TUNE_THRESHOLD,
     BEST_MODEL_PATH,
+
+    # Paths
     EXPERIMENTS_DIR,
     PLOTS_DIR,
+
+    # Data
     SEQ_LENGTH,
     NUM_CLASSES,
-    # Labeling configuration
     USE_LOG_RETURNS,
     DIRECTION_THRESHOLD,
     FORECAST_HORIZONS,
     USE_MULTI_HORIZON,
     FREQUENCY,
-    # UP-vs-REST threshold grid + selection metric
-    UP_THRESHOLD_GRID,
+
+    # Quantile forecasting (9c)
+    FORECAST_HORIZON,
+    QUANTILES,
+    N_QUANTILES,
+
+    # Thresholding / trading knobs (9b/9c)
+    EVAL_THRESHOLD,
+    AUTO_TUNE_THRESHOLD,
     THRESHOLD_SELECTION_METRIC,
+    UP_THRESHOLD_GRID,   # kept for backward compatibility
+    SCORE_GRID,
+    SIGNAL_HORIZON,
+    SCORE_EPS,
+    ACTIVE_THRESHOLD_GRID,
+    ACTIVE_SELECTION_METRIC,
+    ACTIVE_AUTO_TUNE,
+
+    # Trading/costs
     NON_OVERLAPPING_TRADES,
     TRADING_DAYS_PER_YEAR,
     COST_BPS,
     SLIPPAGE_BPS,
+
+    # Baselines
     RANDOM_BASELINE_RUNS,
     RANDOM_SEED,
 )
-from experiment_9b import config as cfg
-from experiment_9b.data_pipeline import prepare_datasets
-from experiment_9b.tft_model import TemporalFusionTransformer
-from experiment_9b import utils
+from experiment_9c import config as cfg
+from experiment_9c.data_pipeline import prepare_datasets
+from experiment_9c.tft_model import TemporalFusionTransformer
+from experiment_9c import utils
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +186,105 @@ def run_inference_classification(
 
     return y_true, y_prob, avg_loss
 
+def _nearest_quantile_index(quantiles: list[float], q: float) -> int:
+    """Return the index of the quantile value closest to q."""
+    if len(quantiles) == 0:
+        raise ValueError("quantiles list is empty.")
+    return int(np.argmin(np.abs(np.asarray(quantiles, dtype=float) - float(q))))
+
+
+def _to_simple_returns(r: np.ndarray) -> np.ndarray:
+    """
+    Trading utilities compound via prod(1+r), so they expect SIMPLE returns.
+    If targets are log-returns, convert: simple = exp(log) - 1.
+    """
+    r = np.asarray(r, dtype=float)
+    if USE_LOG_RETURNS:
+        return np.expm1(r)
+    return r
+
+
+def run_inference_quantile(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    quantiles: list[float],
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Run inference for quantile multi-horizon forecasting and return:
+        y_true (N, H), y_pred (N, H, Q), avg_pinball_loss (scalar)
+    """
+    model.eval()
+    total_loss = 0.0
+    total_count = 0
+
+    all_true: list[torch.Tensor] = []
+    all_pred: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for batch in data_loader:
+            x_past, x_future, y = _unpack_batch(batch, device)  # y: (B, H) float
+
+            if x_future is not None:
+                y_hat = model(x_past, x_future)  # (B, H, Q)
+            else:
+                y_hat = model(x_past)
+
+            if y_hat.ndim != 3:
+                raise RuntimeError(f"Expected y_hat to have 3 dims (B,H,Q), got shape={tuple(y_hat.shape)}")
+            if y_hat.shape[0] != y.shape[0] or y_hat.shape[1] != y.shape[1]:
+                raise RuntimeError(
+                    f"Shape mismatch: y_hat={tuple(y_hat.shape)} vs y={tuple(y.shape)}"
+                )
+
+            loss = utils.pinball_loss(y, y_hat, quantiles)
+            batch_size = y.size(0)
+            total_loss += float(loss.item()) * batch_size
+            total_count += batch_size
+
+            all_true.append(y.detach().cpu())
+            all_pred.append(y_hat.detach().cpu())
+
+    if total_count == 0:
+        raise RuntimeError("DataLoader is empty in run_inference_quantile.")
+
+    y_true = torch.cat(all_true, dim=0).numpy()
+    y_pred = torch.cat(all_pred, dim=0).numpy()
+    avg_loss = total_loss / float(total_count)
+
+    return y_true, y_pred, avg_loss
+
+
+def _build_score_mu_iqr(
+    y_pred: np.ndarray,
+    quantiles: list[float],
+    signal_idx: int,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    """
+    Score for trading (9c):
+        mu  = q50 at signal horizon
+        iqr = q90 - q10 at signal horizon
+        score = mu / (iqr + eps)
+
+    Returns (score, mu, iqr, indices_dict)
+    """
+    if y_pred.ndim != 3:
+        raise ValueError(f"Expected y_pred shape (N,H,Q), got {y_pred.shape}")
+
+    q10_i = _nearest_quantile_index(quantiles, 0.1)
+    q50_i = _nearest_quantile_index(quantiles, 0.5)
+    q90_i = _nearest_quantile_index(quantiles, 0.9)
+
+    q10 = y_pred[:, signal_idx, q10_i]
+    mu = y_pred[:, signal_idx, q50_i]
+    q90 = y_pred[:, signal_idx, q90_i]
+
+    iqr = q90 - q10
+    iqr_safe = np.where(iqr > eps, iqr, eps)
+    score = mu / iqr_safe
+
+    return score, mu, iqr, {"q10": q10_i, "q50": q50_i, "q90": q90_i}
 
 # ---------------------------------------------------------------------------
 # Main evaluation logic
@@ -741,6 +857,330 @@ def main() -> None:
         sweep_path = os.path.join(
             EXPERIMENTS_DIR, f"{eval_id}_up_vs_rest_threshold_sweep.json"
         )
+        utils.save_json(sweep_records, sweep_path)
+        print(f"[evaluate_tft] Threshold sweep saved to {sweep_path}")
+
+    elif TASK_TYPE in ("quantile_forecast", "regression_quantile"):
+        print(
+            f"[evaluate_tft] TASK_TYPE='{TASK_TYPE}' -> multi-horizon quantile forecast "
+            f"(H={FORECAST_HORIZON}, QUANTILES={QUANTILES}, output_size={FORECAST_HORIZON * N_QUANTILES})."
+        )
+
+        H = int(getattr(cfg, "FORECAST_HORIZON", FORECAST_HORIZON))
+        quantiles = list(getattr(cfg, "QUANTILES", QUANTILES))
+        signal_h = int(getattr(cfg, "SIGNAL_HORIZON", SIGNAL_HORIZON))
+        if signal_h < 1 or signal_h > H:
+            raise ValueError(f"SIGNAL_HORIZON={signal_h} must be in [1, {H}]")
+        signal_idx = signal_h - 1
+
+        eps = float(getattr(cfg, "SCORE_EPS", SCORE_EPS))
+
+        # --- Inference ---
+        print("[evaluate_tft] Running inference on validation set (quantile).")
+        y_val_true, y_val_pred, val_pinball = run_inference_quantile(
+            model, val_loader, device, quantiles
+        )
+
+        print("[evaluate_tft] Running inference on test set (quantile).")
+        y_test_true, y_test_pred, test_pinball = run_inference_quantile(
+            model, test_loader, device, quantiles
+        )
+
+        # --- Forecast metrics (median MAE at SIGNAL_HORIZON) ---
+        q50_i = _nearest_quantile_index(quantiles, 0.5)
+        val_mae = float(np.mean(np.abs(y_val_pred[:, signal_idx, q50_i] - y_val_true[:, signal_idx])))
+        test_mae = float(np.mean(np.abs(y_test_pred[:, signal_idx, q50_i] - y_test_true[:, signal_idx])))
+
+        print("[evaluate_tft] Validation forecast metrics:")
+        print(f"  Val pinball: {val_pinball:.6f}")
+        print(f"  Val MAE@{signal_h}: {val_mae:.6f}")
+
+        print("[evaluate_tft] Test forecast metrics:")
+        print(f"  Test pinball: {test_pinball:.6f}")
+        print(f"  Test MAE@{signal_h}: {test_mae:.6f}")
+
+        # --- Build score series (full resolution; later downsample for trading if needed) ---
+        score_val, mu_val, iqr_val, q_idx = _build_score_mu_iqr(
+            y_pred=y_val_pred, quantiles=quantiles, signal_idx=signal_idx, eps=eps
+        )
+        score_test, mu_test, iqr_test, _ = _build_score_mu_iqr(
+            y_pred=y_test_pred, quantiles=quantiles, signal_idx=signal_idx, eps=eps
+        )
+
+        # True returns for trading should come from the true target at SIGNAL_HORIZON
+        # (this makes evaluation correct even if SIGNAL_HORIZON != FORECAST_HORIZON).
+        val_returns = _to_simple_returns(y_val_true[:, signal_idx])
+        test_returns = _to_simple_returns(y_test_true[:, signal_idx])
+
+        # --- Non-overlapping trades ---
+        trade_horizon_steps = int(signal_h)
+        if NON_OVERLAPPING_TRADES and trade_horizon_steps > 1:
+            print(
+                "[evaluate_tft] Using non-overlapping trades for trading metrics "
+                f"(horizon_steps={trade_horizon_steps})."
+            )
+            idx = np.arange(0, val_returns.shape[0], trade_horizon_steps)
+
+            val_returns_tr = val_returns[idx]
+            score_val_tr = score_val[idx]
+            mu_val_tr = mu_val[idx]
+
+            idx_t = np.arange(0, test_returns.shape[0], trade_horizon_steps)
+            test_returns_tr = test_returns[idx_t]
+            score_test_tr = score_test[idx_t]
+            mu_test_tr = mu_test[idx_t]
+        else:
+            val_returns_tr = val_returns
+            test_returns_tr = test_returns
+            score_val_tr = score_val
+            score_test_tr = score_test
+            mu_val_tr = mu_val
+            mu_test_tr = mu_test
+
+        # --- Threshold sweep over SCORE (select τ* on val by ACTIVE_SELECTION_METRIC) ---
+        threshold_grid: list[float] = list(getattr(cfg, "ACTIVE_THRESHOLD_GRID", ACTIVE_THRESHOLD_GRID)) \
+            or list(getattr(cfg, "SCORE_GRID", SCORE_GRID)) \
+            or [float(EVAL_THRESHOLD)]
+
+        selection_metric = str(getattr(cfg, "ACTIVE_SELECTION_METRIC", ACTIVE_SELECTION_METRIC))
+        auto_tune = bool(getattr(cfg, "ACTIVE_AUTO_TUNE", ACTIVE_AUTO_TUNE))
+        selection_key = selection_metric.lower().strip()
+
+        print("[evaluate_tft] Threshold sweep on score = mu/(iqr+eps) for LONG-only:")
+        print(f"  Grid: {threshold_grid}")
+        print(f"  Selection metric (val): {selection_metric}")
+        print(f"  AUTO_TUNE_THRESHOLD   : {auto_tune}")
+        print(f"  Score quantile idx: {q_idx}  (mu=q50, iqr=q90-q10)")
+
+        sweep_records: list[dict[str, Any]] = []
+
+        best_threshold: float | None = None
+        best_val_score: float = -np.inf
+        best_val_trading: dict[str, float] | None = None
+        best_test_trading: dict[str, float] | None = None
+
+        for thr in threshold_grid:
+            thr = float(thr)
+
+            # LONG rule (9c): score >= thr AND mu > 0
+            pos_val = ((score_val_tr >= thr) & (mu_val_tr > 0)).astype(int)
+            pos_test = ((score_test_tr >= thr) & (mu_test_tr > 0)).astype(int)
+
+            val_trading = utils.compute_trading_metrics(
+                returns=val_returns_tr,
+                positions=pos_val,
+                trading_days_per_year=TRADING_DAYS_PER_YEAR,
+            )
+            test_trading = utils.compute_trading_metrics(
+                returns=test_returns_tr,
+                positions=pos_test,
+                trading_days_per_year=TRADING_DAYS_PER_YEAR,
+            )
+
+            if selection_key in val_trading:
+                val_score = float(val_trading[selection_key])
+            else:
+                raise ValueError(
+                    f"Unknown selection metric '{selection_metric}'. "
+                    f"Not found in trading metrics keys={list(val_trading.keys())}"
+                )
+
+            sweep_records.append(
+                {
+                    "threshold": thr,
+                    "val_trading": val_trading,
+                    "test_trading": test_trading,
+                    "selection_score": val_score,
+                    "val_long_rate": float(np.mean(pos_val)),
+                    "test_long_rate": float(np.mean(pos_test)),
+                }
+            )
+
+            if auto_tune and np.isfinite(val_score) and val_score > best_val_score:
+                best_val_score = val_score
+                best_threshold = thr
+                best_val_trading = val_trading
+                best_test_trading = test_trading
+
+        # Fallback if autotune disabled/failed
+        if (not auto_tune) or (best_threshold is None):
+            best_threshold = float(EVAL_THRESHOLD)
+            print(
+                f"[evaluate_tft] Auto-tuning disabled or failed, "
+                f"falling back to EVAL_THRESHOLD={best_threshold:.3f}"
+            )
+            pos_val = ((score_val_tr >= best_threshold) & (mu_val_tr > 0)).astype(int)
+            pos_test = ((score_test_tr >= best_threshold) & (mu_test_tr > 0)).astype(int)
+            best_val_trading = utils.compute_trading_metrics(
+                returns=val_returns_tr,
+                positions=pos_val,
+                trading_days_per_year=TRADING_DAYS_PER_YEAR,
+            )
+            best_test_trading = utils.compute_trading_metrics(
+                returns=test_returns_tr,
+                positions=pos_test,
+                trading_days_per_year=TRADING_DAYS_PER_YEAR,
+            )
+        else:
+            print(
+                f"[evaluate_tft] Best threshold on val ({selection_key}): "
+                f"{best_threshold:.3f} with score={best_val_score:.6f}"
+            )
+
+        thr_star = float(best_threshold)
+
+        # --- Net-of-cost backtest + baselines (same structure as 9b) ---
+        pos_val = ((score_val_tr >= thr_star) & (mu_val_tr > 0)).astype(int)
+        pos_test = ((score_test_tr >= thr_star) & (mu_test_tr > 0)).astype(int)
+
+        val_long_rate = float(np.mean(pos_val))
+        test_long_rate = float(np.mean(pos_test))
+
+        val_costs = utils.apply_costs(pos_val, cost_bps=COST_BPS, slippage_bps=SLIPPAGE_BPS)
+        test_costs = utils.apply_costs(pos_test, cost_bps=COST_BPS, slippage_bps=SLIPPAGE_BPS)
+
+        val_net_returns = pos_val.astype(float) * val_returns_tr - val_costs
+        test_net_returns = pos_test.astype(float) * test_returns_tr - test_costs
+
+        val_equity = utils.equity_curve(val_returns_tr, pos_val, val_costs)
+        test_equity = utils.equity_curve(test_returns_tr, pos_test, test_costs)
+
+        strategy_net_val = utils.compute_backtest_metrics(
+            equity=val_equity,
+            net_returns=val_net_returns,
+            trading_days_per_year=TRADING_DAYS_PER_YEAR,
+            positions=pos_val,
+        )
+        strategy_net_test = utils.compute_backtest_metrics(
+            equity=test_equity,
+            net_returns=test_net_returns,
+            trading_days_per_year=TRADING_DAYS_PER_YEAR,
+            positions=pos_test,
+        )
+
+        buy_hold_net_val = utils.buy_and_hold_baseline(
+            returns=val_returns_tr,
+            cost_bps=COST_BPS,
+            slippage_bps=SLIPPAGE_BPS,
+            trading_days_per_year=TRADING_DAYS_PER_YEAR,
+        )
+        buy_hold_net_test = utils.buy_and_hold_baseline(
+            returns=test_returns_tr,
+            cost_bps=COST_BPS,
+            slippage_bps=SLIPPAGE_BPS,
+            trading_days_per_year=TRADING_DAYS_PER_YEAR,
+        )
+
+        random_baseline_val = utils.random_exposure_baseline(
+            returns=val_returns_tr,
+            long_rate=val_long_rate,
+            runs=RANDOM_BASELINE_RUNS,
+            seed=RANDOM_SEED,
+            cost_bps=COST_BPS,
+            slippage_bps=SLIPPAGE_BPS,
+            trading_days_per_year=TRADING_DAYS_PER_YEAR,
+        )
+        random_baseline_test = utils.random_exposure_baseline(
+            returns=test_returns_tr,
+            long_rate=test_long_rate,
+            runs=RANDOM_BASELINE_RUNS,
+            seed=RANDOM_SEED,
+            cost_bps=COST_BPS,
+            slippage_bps=SLIPPAGE_BPS,
+            trading_days_per_year=TRADING_DAYS_PER_YEAR,
+        )
+
+        # --- Print summaries ---
+        print(f"[evaluate_tft] Long-only trading metrics at τ* (signal={signal_h}):")
+        print("  Validation:")
+        for k, v in (best_val_trading or {}).items():
+            print(f"    {k}: {v:.6f}")
+        print("  Test:")
+        for k, v in (best_test_trading or {}).items():
+            print(f"    {k}: {v:.6f}")
+
+        print(
+            f"[evaluate_tft] Net-of-cost backtest at τ* "
+            f"(cost={COST_BPS}bps, slippage={SLIPPAGE_BPS}bps, annual={TRADING_DAYS_PER_YEAR}):"
+        )
+        print(
+            "  Strategy (net): "
+            f"Val Sharpe={strategy_net_val['sharpe']:.4f}, "
+            f"MDD={strategy_net_val['max_drawdown']:.4f}, "
+            f"CumRet={strategy_net_val['cumulative_return']:.4f} | "
+            f"Test Sharpe={strategy_net_test['sharpe']:.4f}, "
+            f"MDD={strategy_net_test['max_drawdown']:.4f}, "
+            f"CumRet={strategy_net_test['cumulative_return']:.4f}"
+        )
+        print(
+            "  Buy&Hold (net): "
+            f"Val Sharpe={buy_hold_net_val['sharpe']:.4f}, "
+            f"MDD={buy_hold_net_val['max_drawdown']:.4f}, "
+            f"CumRet={buy_hold_net_val['cumulative_return']:.4f} | "
+            f"Test Sharpe={buy_hold_net_test['sharpe']:.4f}, "
+            f"MDD={buy_hold_net_test['max_drawdown']:.4f}, "
+            f"CumRet={buy_hold_net_test['cumulative_return']:.4f}"
+        )
+        print(
+            "  Random baseline (same long-rate): "
+            f"Test p95 Sharpe={random_baseline_test['sharpe_p95']:.4f}, "
+            f"p95 CumRet={random_baseline_test['cumulative_return_p95']:.4f}"
+        )
+
+        # --- Plots: score histograms (reuse existing histogram util) ---
+        val_hist_path = os.path.join(PLOTS_DIR, f"{eval_id}_val_score_hist.png")
+        utils.plot_probability_histogram(
+            y_prob=score_val,  # yes, it's a score now; function is just a histogram helper
+            out_path=val_hist_path,
+            threshold=thr_star,
+            title=f"Val score histogram (mu/iqr), signal={signal_h}",
+        )
+        print(f"[evaluate_tft] Validation score histogram saved to {val_hist_path}")
+
+        test_hist_path = os.path.join(PLOTS_DIR, f"{eval_id}_test_score_hist.png")
+        utils.plot_probability_histogram(
+            y_prob=score_test,
+            out_path=test_hist_path,
+            threshold=thr_star,
+            title=f"Test score histogram (mu/iqr), signal={signal_h}",
+        )
+        print(f"[evaluate_tft] Test score histogram saved to {test_hist_path}")
+
+        # --- Save outputs ---
+        metrics_out.update(
+            {
+                "task_type": TASK_TYPE,
+                "forecast": {
+                    "H": int(H),
+                    "quantiles": [float(q) for q in quantiles],
+                    "signal_horizon": int(signal_h),
+                    "q_indices": q_idx,
+                    "val_pinball": float(val_pinball),
+                    "test_pinball": float(test_pinball),
+                    "val_mae_at_signal": float(val_mae),
+                    "test_mae_at_signal": float(test_mae),
+                },
+                "signal": {
+                    "score_definition": "score = mu / (iqr + eps), long if score>=thr and mu>0",
+                    "eps": float(eps),
+                    "selected_threshold": float(thr_star),
+                    "threshold_sweep": sweep_records,
+                    "val_trading_metrics": best_val_trading or {},
+                    "test_trading_metrics": best_test_trading or {},
+                },
+                "costs_and_baselines": {
+                    "trading_days_per_year": int(TRADING_DAYS_PER_YEAR),
+                    "cost_bps": float(COST_BPS),
+                    "slippage_bps": float(SLIPPAGE_BPS),
+                    "strategy_long_rate": {"val": float(val_long_rate), "test": float(test_long_rate)},
+                    "strategy_net": {"val": strategy_net_val, "test": strategy_net_test},
+                    "buy_hold_net": {"val": buy_hold_net_val, "test": buy_hold_net_test},
+                    "random_baseline_summary": {"val": random_baseline_val, "test": random_baseline_test},
+                },
+            }
+        )
+
+        sweep_path = os.path.join(EXPERIMENTS_DIR, f"{eval_id}_score_threshold_sweep.json")
         utils.save_json(sweep_records, sweep_path)
         print(f"[evaluate_tft] Threshold sweep saved to {sweep_path}")
 

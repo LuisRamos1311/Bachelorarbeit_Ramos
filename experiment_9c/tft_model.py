@@ -29,7 +29,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from experiment_9b import config
+from experiment_9c import config
 
 
 # ============================
@@ -422,9 +422,9 @@ class TemporalFusionTransformer(nn.Module):
         # We aggregate over time (last time step), optionally fuse
         # with future covariates, and map hidden_size → output_size.
         #
-        # In this classification setup:
-        #   - TASK_TYPE = "classification"
-        #   - MODEL_CONFIG.output_size = NUM_CLASSES (3)
+        # Output head:
+        # - classification: output_size = NUM_CLASSES  -> (B, 3)
+        # - quantile_forecast (9c): output_size = H * Q -> (B, H*Q) then reshape to (B, H, Q)
         self.output_layer = nn.Linear(hidden_size, self.config.output_size)
 
     def forward(
@@ -574,10 +574,27 @@ class TemporalFusionTransformer(nn.Module):
             fusion_output = last_timestep
 
         # ---- Step 7: Final output layer ----
-        # Map to final outputs: (B, output_size)
-        #   - Experiment: (B, 3) logits for 1-day direction.
-        #   - Future: regression or multi-horizon if you reconfigure config.
-        outputs = self.output_layer(fusion_output)
+        raw = self.output_layer(fusion_output)  # (B, output_size)
+
+        task_type = getattr(config, "TASK_TYPE", "classification")
+
+        if task_type in ("quantile_forecast", "regression_quantile"):
+            # Expect raw to be (B, H*Q) -> reshape to (B, H, Q)
+            H = int(getattr(config, "FORECAST_HORIZON", getattr(config, "FORECAST_HORIZONS", [1])[0]))
+            quantiles = getattr(config, "QUANTILES", [0.5])
+            Q = int(getattr(config, "N_QUANTILES", len(quantiles)))
+
+            expected = H * Q
+            if raw.shape[-1] != expected:
+                raise ValueError(
+                    f"[tft_model] Output size mismatch for quantile_forecast: "
+                    f"got {raw.shape[-1]} but expected H*Q={expected} (H={H}, Q={Q}). "
+                    f"Check config.MODEL_CONFIG.output_size."
+                )
+
+            outputs = raw.view(raw.size(0), H, Q)  # (B, H, Q)
+        else:
+            outputs = raw  # classification logits etc.
 
         if return_attention:
             return outputs, attn_weights

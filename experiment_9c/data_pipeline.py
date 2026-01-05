@@ -1,6 +1,6 @@
 """
 Turns raw BTC price data (daily or hourly) into PyTorch Datasets for the TFT
-model used in the experiment_9b setup.
+model used in the experiment_9c setup.
 
 Main steps:
 1. Load BTC price data from CSV (daily or hourly, depending on config).
@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import torch
 import talib  # Technical Analysis library (C + Python wrapper)
-from experiment_9b import config
+from experiment_9c import config
 
 from torch.utils.data import Dataset
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
@@ -711,6 +711,25 @@ def add_target_column(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def compute_future_return(close: pd.Series, h: int, use_log_returns: bool) -> pd.Series:
+    if use_log_returns:
+        return np.log(close.shift(-h) / close)
+    else:
+        return close.shift(-h) / close - 1.0
+
+
+def add_multi_horizon_targets(df: pd.DataFrame, H: int, use_log_returns: bool) -> pd.DataFrame:
+    """
+    Adds y_ret_1..y_ret_H columns where y_ret_h is the return from t -> t+h.
+    """
+
+    prefix = getattr(config, "TARGET_RET_PREFIX", "y_ret_")
+
+    close = df["close"]
+    for h in range(1, H + 1):
+        df[f"{prefix}{h}"] = compute_future_return(close, h, use_log_returns)
+
+    return df
 
 def print_label_distribution(
     df: pd.DataFrame,
@@ -920,9 +939,10 @@ def build_sequences(
     seq_length: int = config.SEQ_LENGTH,
     future_cols: List[str] | None = None,
     label_col: str | None = config.TARGET_COLUMN,
+    target_cols: List[str] | None = None,   # <-- NEW for 9c
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
-    Build sliding-window sequences and labels from a DataFrame for classification.
+    Build sliding-window sequences and labels from a DataFrame for classification and quantile forecasting.
 
     For each sample, we create:
       - X_past: sequence of length `seq_length` over `feature_cols`
@@ -950,14 +970,34 @@ def build_sequences(
     feature_array = df[feature_cols].values.astype(np.float32)
 
     # Targets: scalar classification label
-    if label_col is None:
-        raise ValueError("label_col must be provided for classification.")
-    if label_col not in df.columns:
-        raise ValueError(
-            f"DataFrame must contain '{label_col}' column before building sequences."
-        )
+    task_type = getattr(config, "TASK_TYPE", "classification")
 
-    target_array = df[label_col].values.astype(np.int64)
+    if task_type == "quantile_forecast":
+        # Targets: multi-horizon regression vector (H,)
+        if target_cols is None:
+            raise ValueError(
+                "target_cols must be provided for quantile_forecast "
+                "(e.g., config.TARGET_RET_COLS = ['y_ret_1', ... 'y_ret_24'])."
+            )
+        missing_tgt = [c for c in target_cols if c not in df.columns]
+        if missing_tgt:
+            raise ValueError(
+                f"Missing target columns in df: {missing_tgt}. "
+                "Make sure multi-horizon targets were created before build_sequences()."
+            )
+        # (len(df), H)
+        target_array = df[target_cols].values.astype(np.float32)
+
+    else:
+        # Targets: scalar classification label
+        if label_col is None:
+            raise ValueError("label_col must be provided for classification.")
+        if label_col not in df.columns:
+            raise ValueError(
+                f"DataFrame must contain '{label_col}' column before building sequences."
+            )
+        # (len(df),)
+        target_array = df[label_col].values.astype(np.int64)
 
     # Future covariates
     if future_cols is not None:
@@ -981,7 +1021,15 @@ def build_sequences(
 
         # Past sequence for [start_idx, ... end_idx]
         seq_x = feature_array[start_idx: end_idx + 1]   # (seq_length, n_features)
-        y = target_array[end_idx]                       # scalar at end_idx
+        if task_type == "quantile_forecast":
+            y = target_array[end_idx]  # (H,) float32
+            if np.isnan(y).any():
+                raise ValueError(
+                    f"NaNs found in multi-horizon target at end_idx={end_idx}. "
+                    "Check tail-dropping (DROP_LAST_H_IN_EACH_SPLIT) and target creation."
+                )
+        else:
+            y = target_array[end_idx]  # scalar int64
 
         sequences.append(seq_x)
         labels.append(y)
@@ -992,7 +1040,10 @@ def build_sequences(
             future_covariates.append(f)
 
     sequences_arr = np.stack(sequences)  # (N, seq_length, n_features)
-    labels_arr = np.array(labels)        # (N,)
+    if task_type in ("quantile_forecast", "regression_quantile"):
+        labels_arr = np.stack(labels).astype(np.float32)  # (N, H)
+    else:
+        labels_arr = np.array(labels, dtype=np.int64)  # (N,)
 
     if future_array is not None:
         future_covariates_arr: np.ndarray | None = np.stack(
@@ -1037,7 +1088,14 @@ class BTCTFTDataset(Dataset):
 
         self.sequences = torch.from_numpy(sequences).float()
         # Long dtype for CrossEntropyLoss (class indices)
-        self.labels = torch.from_numpy(labels).long()
+        task_type = getattr(config, "TASK_TYPE", "classification")
+
+        if task_type in ("quantile_forecast", "regression_quantile"):
+            # (N, H) float targets for pinball loss
+            self.labels = torch.from_numpy(labels).float()
+        else:
+            # (N,) integer class indices for CrossEntropyLoss
+            self.labels = torch.from_numpy(labels).long()
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -1051,27 +1109,40 @@ class BTCTFTDataset(Dataset):
 # Compute targets *inside a split*
 def label_split_safely(df_split: pd.DataFrame, split_name: str) -> pd.DataFrame:
     """
-    Experiment 9a (Part A):
-    Compute targets *inside a split* so shift(-H) never crosses split boundaries.
+    Experiment 9c:
+    Compute targets *inside a split* so future returns never cross split boundaries.
+    Works for both classification and quantile forecasting.
     """
     if not isinstance(df_split.index, pd.DatetimeIndex):
         raise TypeError(f"[{split_name}] Expected DatetimeIndex.")
     if len(df_split) == 0:
         raise ValueError(f"[{split_name}] Split is empty.")
 
-    # Ensure chronological order
     if not df_split.index.is_monotonic_increasing:
         df_split = df_split.sort_index()
 
     end_ts_before = df_split.index[-1]
 
-    # This call does the shift(-H) inside df_split, then dropna removes the tail
-    df_labeled = add_target_column(df_split)
+    horizons = list(getattr(config, "FORECAST_HORIZONS", [1])) or [1]
+    max_h = max(int(h) for h in horizons)
 
-    # Optional integrity debug: verify last usable row is <= end - max_h
+    # ---- 9c path: multi-horizon returns ----
+    if getattr(config, "TASK_TYPE", "") in ("quantile_forecast", "regression_quantile"):
+        df_labeled = add_multi_horizon_targets(df_split.copy(), H=max_h, use_log_returns=config.USE_LOG_RETURNS)
+
+        prefix = getattr(config, "TARGET_RET_PREFIX", "y_ret_")
+        target_cols = [f"{prefix}{h}" for h in range(1, max_h + 1)]
+        df_labeled = df_labeled.dropna(subset=target_cols)
+
+    # ---- legacy path: single-horizon classification ----
+    else:
+        df_labeled = add_target_column(df_split.copy())  # existing behavior
+
+    if len(df_labeled) == 0:
+        raise ValueError(f"[{split_name}] No labeled rows after target creation (split too small for H={max_h}?).")
+
+    # ---- Integrity debug ----
     if getattr(config, "DEBUG_DATA_INTEGRITY", False):
-        horizons = list(getattr(config, "FORECAST_HORIZONS", [1])) or [1]
-        max_h = max(int(h) for h in horizons)
         if len(df_split) > max_h:
             last_allowed_ts = df_split.index[-max_h - 1]
             if df_labeled.index[-1] > last_allowed_ts:
@@ -1318,79 +1389,111 @@ def prepare_datasets(
         if col not in df.columns:
             raise ValueError(f"Future covariate column '{col}' is missing. Check add_future_covariates().")
 
-    # 7. Print label distributions
-    full_df = pd.concat([train_df, val_df, test_df]).sort_index()
-    print_label_distribution(full_df, name="FULL", freq="Y")
-    print_label_distribution(train_df, name="TRAIN", freq="Y")
-    print_label_distribution(val_df, name="VAL", freq="Y")
-    print_label_distribution(test_df, name="TEST", freq="Y")
+    task_type = getattr(config, "TASK_TYPE", "classification")
+
+    if task_type not in ("quantile_forecast", "regression_quantile"):
+        full_df = pd.concat([train_df, val_df, test_df]).sort_index()
+        print_label_distribution(full_df, name="FULL", freq="Y")
+        print_label_distribution(train_df, name="TRAIN", freq="Y")
+        print_label_distribution(val_df, name="VAL", freq="Y")
+        print_label_distribution(test_df, name="TEST", freq="Y")
 
     # 9. Scale features (for past covariates)
     train_df_scaled, val_df_scaled, test_df_scaled, scalers = scale_features(
         train_df, val_df, test_df, feature_cols
     )
 
-    # 9.5 Extract H-step forward returns aligned with samples (optional).
-    #
-    # For Experiment 6 with hourly data and FORECAST_HORIZONS = [24], this
-    # is the "next 24 hours" return (log or simple), i.e. the same horizon
-    # used for the direction_3c label.
+    # 9c. Extract H-step forward returns aligned with samples (optional).
     def extract_forward_returns(df_scaled: pd.DataFrame, seq_len: int) -> np.ndarray:
-        horizons_cfg = list(getattr(config, "FORECAST_HORIZONS", []))
-        if not horizons_cfg:
-            label_horizon = 1
-        else:
-            label_horizon = int(horizons_cfg[0])
+        """
+        Returns aligned "trade horizon" forward returns for each built sample.
+        - classification: uses future_return_{H}d
+        - quantile_forecast: uses y_ret_{H}
+        """
+        horizons_cfg = list(getattr(config, "FORECAST_HORIZONS", [])) or [1]
+        H = int(horizons_cfg[0])
 
-        if label_horizon == 1:
-            col_name = "future_return_1d"
+        task_type = getattr(config, "TASK_TYPE", "classification")
+
+        if task_type in ("quantile_forecast", "regression_quantile"):
+            prefix = getattr(config, "TARGET_RET_PREFIX", "y_ret_")
+            col_name = f"{prefix}{H}"
         else:
-            col_name = f"future_return_{label_horizon}d"
+            col_name = "future_return_1d" if H == 1 else f"future_return_{H}d"
 
         if col_name not in df_scaled.columns:
             raise ValueError(
-                f"Column '{col_name}' not found. "
-                f"Make sure add_target_column() was called before scaling."
+                f"Column '{col_name}' not found for forward returns extraction. "
+                f"Task={task_type}, H={H}. "
+                f"Make sure targets were created inside each split."
             )
 
         returns_full = df_scaled[col_name].astype(float).values
         if len(returns_full) < seq_len:
             raise ValueError(
-                f"Not enough rows ({len(returns_full)}) to build sequences "
-                f"of length {seq_len}."
+                f"Not enough rows ({len(returns_full)}) to build sequences of length {seq_len}."
             )
-        # Each sequence uses rows [t-seq_len+1 ... t], so the first label/return
-        # corresponds to index t = seq_len-1.
-        return returns_full[seq_len - 1 :]
+        return returns_full[seq_len - 1:]
 
     train_forward = extract_forward_returns(train_df_scaled, seq_length)
     val_forward   = extract_forward_returns(val_df_scaled, seq_length)
     test_forward  = extract_forward_returns(test_df_scaled, seq_length)
 
     # 10. Build sequences + future covariate vectors
-    label_col = config.TARGET_COLUMN
+    task_type = getattr(config, "TASK_TYPE", "classification")
 
-    train_seq, train_labels, train_future = build_sequences(
-        train_df_scaled,
-        feature_cols,
-        seq_length,
-        future_cols=future_cols,
-        label_col=label_col,
-    )
-    val_seq, val_labels, val_future = build_sequences(
-        val_df_scaled,
-        feature_cols,
-        seq_length,
-        future_cols=future_cols,
-        label_col=label_col,
-    )
-    test_seq, test_labels, test_future = build_sequences(
-        test_df_scaled,
-        feature_cols,
-        seq_length,
-        future_cols=future_cols,
-        label_col=label_col,
-    )
+    if task_type in ("quantile_forecast", "regression_quantile"):
+        target_cols = list(getattr(config, "TARGET_RET_COLS", []))
+        if not target_cols:
+            # fallback: build from horizon if you haven't defined TARGET_RET_COLS in config yet
+            H = int(getattr(config, "FORECAST_HORIZONS", [24])[0])
+            prefix = getattr(config, "TARGET_RET_PREFIX", "y_ret_")
+            target_cols = [f"{prefix}{h}" for h in range(1, H + 1)]
+
+        train_seq, train_labels, train_future = build_sequences(
+            train_df_scaled,
+            feature_cols,
+            seq_length,
+            future_cols=future_cols,
+            label_col=None,
+            target_cols=target_cols,
+        )
+        val_seq, val_labels, val_future = build_sequences(
+            val_df_scaled,
+            feature_cols,
+            seq_length,
+            future_cols=future_cols,
+            label_col=None,
+            target_cols=target_cols,
+        )
+        test_seq, test_labels, test_future = build_sequences(
+            test_df_scaled,
+            feature_cols,
+            seq_length,
+            future_cols=future_cols,
+            label_col=None,
+            target_cols=target_cols,
+        )
+    else:
+        label_col = config.TARGET_COLUMN
+
+        train_seq, train_labels, train_future = build_sequences(
+            train_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        )
+        val_seq, val_labels, val_future = build_sequences(
+            val_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        )
+        test_seq, test_labels, test_future = build_sequences(
+            test_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        )
+
+    if task_type in ("quantile_forecast", "regression_quantile"):
+        H = int(getattr(config, "FORECAST_HORIZON", 24))
+        assert train_labels.ndim == 2 and train_labels.shape[1] == H
+        assert val_labels.ndim == 2 and val_labels.shape[1] == H
+        assert test_labels.ndim == 2 and test_labels.shape[1] == H
+        assert not np.isnan(train_labels).any()
+        assert train_labels.dtype == np.float32 or train_labels.dtype == np.float64
 
     # Sanity check: returns must align with number of samples
     if (

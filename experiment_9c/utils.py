@@ -251,6 +251,117 @@ def compute_multiclass_metrics(
 # 4. TRADING HELPERS
 # ============================================================
 
+def pinball_loss(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    quantiles: Sequence[float],
+) -> torch.Tensor:
+    """
+    Pinball (quantile) loss for multi-horizon forecasting.
+
+    Shapes:
+      y_true: (B, H)
+      y_pred: (B, H, Q)
+      quantiles: length Q (e.g. [0.1, 0.5, 0.9])
+
+    Returns:
+      scalar tensor (mean over batch, horizons, quantiles)
+    """
+    if not torch.is_tensor(y_pred):
+        y_pred = torch.as_tensor(y_pred)
+
+    # Put y_true on same device/dtype as predictions (important for training)
+    if not torch.is_tensor(y_true):
+        y_true = torch.as_tensor(y_true, device=y_pred.device, dtype=y_pred.dtype)
+    else:
+        y_true = y_true.to(device=y_pred.device, dtype=y_pred.dtype)
+
+    if y_true.ndim != 2:
+        raise ValueError(f"pinball_loss expects y_true to have shape (B,H), got {tuple(y_true.shape)}")
+    if y_pred.ndim != 3:
+        raise ValueError(f"pinball_loss expects y_pred to have shape (B,H,Q), got {tuple(y_pred.shape)}")
+
+    B, H = y_true.shape
+    if y_pred.shape[0] != B or y_pred.shape[1] != H:
+        raise ValueError(
+            f"pinball_loss shape mismatch: y_true is (B,H)=({B},{H}) "
+            f"but y_pred is {tuple(y_pred.shape)}"
+        )
+
+    Q = y_pred.shape[2]
+    if len(quantiles) != Q:
+        raise ValueError(
+            f"pinball_loss quantiles mismatch: got {len(quantiles)} quantiles "
+            f"but y_pred has Q={Q}"
+        )
+
+    q = torch.tensor(quantiles, device=y_pred.device, dtype=y_pred.dtype).view(1, 1, Q)
+
+    # err = y - y_hat
+    err = y_true.unsqueeze(-1) - y_pred
+
+    # max((q-1)*err, q*err)
+    loss = torch.maximum((q - 1.0) * err, q * err)
+    return loss.mean()
+
+def _closest_quantile_index(quantiles: Sequence[float], target: float = 0.5) -> int:
+    """
+    Return index of quantile closest to `target` (default median=0.5).
+    """
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must be non-empty.")
+    diffs = [abs(float(q) - target) for q in quantiles]
+    return int(np.argmin(diffs))
+
+
+def mae_on_median_at_horizon(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    quantiles: Sequence[float],
+    horizon_step: int | None = None,
+) -> float:
+    """
+    Compute MAE using the median (q≈0.5) forecast.
+
+    Shapes:
+      y_true: (B,H)
+      y_pred: (B,H,Q)
+
+    Args:
+      horizon_step:
+        If None -> use last step (H).
+        If provided -> 1-based horizon step (e.g. 24 means the 24h-ahead step).
+
+    Returns:
+      float MAE
+    """
+    if not torch.is_tensor(y_pred):
+        y_pred = torch.as_tensor(y_pred)
+    if not torch.is_tensor(y_true):
+        y_true = torch.as_tensor(y_true, device=y_pred.device, dtype=y_pred.dtype)
+    else:
+        y_true = y_true.to(device=y_pred.device, dtype=y_pred.dtype)
+
+    if y_true.ndim != 2 or y_pred.ndim != 3:
+        raise ValueError(
+            f"mae_on_median_at_horizon expects y_true (B,H) and y_pred (B,H,Q), "
+            f"got y_true={tuple(y_true.shape)} y_pred={tuple(y_pred.shape)}"
+        )
+
+    B, H = y_true.shape
+    q_idx = _closest_quantile_index(quantiles, target=0.5)
+
+    if horizon_step is None:
+        h_idx = H - 1
+    else:
+        if horizon_step < 1 or horizon_step > H:
+            raise ValueError(f"horizon_step must be in [1, {H}], got {horizon_step}")
+        h_idx = horizon_step - 1
+
+    y_med = y_pred[:, h_idx, q_idx]
+    err = torch.abs(y_med - y_true[:, h_idx])
+    return float(err.mean().item())
+
 def positions_from_threshold(
     y_prob_up: Any,
     threshold: float,
@@ -601,7 +712,7 @@ def select_non_overlapping_trades(
 
     Args:
         returns: 1D array-like of H-step forward returns (aligned per sample).
-        scores:  1D array-like of scores/probabilities for P(UP) at each sample.
+        scores: 1D array-like of signal scores (e.g., P(UP) or quantile-based score)
         horizon: H, the forecast horizon in steps (e.g. 24 for 24h-ahead).
 
     Returns:
@@ -637,6 +748,7 @@ def plot_training_curves(history: Dict[str, Sequence[float]], out_path: str) -> 
         - MAE          (train_mae / val_mae)
         - Direction Acc (train_direction_accuracy / val_direction_accuracy)
         - R^2          (train_r2 / val_r2)
+        - Pinball (train_pinball / val_pinball)
 
     Args:
         history:

@@ -1,0 +1,162 @@
+[
+  {
+    "threshold": 0.0,
+    "val_trading": {
+      "avg_daily_return": 0.002813445083988148,
+      "cumulative_return": 1.507053889282294,
+      "sharpe": 2.318419953721079,
+      "hit_ratio": 0.4930747922437673,
+      "avg_return_in_position": 0.002813445083988148
+    },
+    "test_trading": {
+      "avg_daily_return": 0.0024486293239317884,
+      "cumulative_return": 1.111895212614277,
+      "sharpe": 1.6830095313800941,
+      "hit_ratio": 0.5220994475138122,
+      "avg_return_in_position": 0.0024486293239317884
+    },
+    "selection_score": 2.318419953721079,
+    "val_long_rate": 1.0,
+    "test_long_rate": 1.0
+  },
+  {
+    "threshold": 0.25,
+    "val_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "test_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "selection_score": 0.0,
+    "val_long_rate": 0.0,
+    "test_long_rate": 0.0
+  },
+  {
+    "threshold": 0.5,
+    "val_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "test_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "selection_score": 0.0,
+    "val_long_rate": 0.0,
+    "test_long_rate": 0.0
+  },
+  {
+    "threshold": 0.75,
+    "val_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "test_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "selection_score": 0.0,
+    "val_long_rate": 0.0,
+    "test_long_rate": 0.0
+  },
+  {
+    "threshold": 1.0,
+    "val_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "test_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "selection_score": 0.0,
+    "val_long_rate": 0.0,
+    "test_long_rate": 0.0
+  },
+  {
+    "threshold": 1.25,
+    "val_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "test_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "selection_score": 0.0,
+    "val_long_rate": 0.0,
+    "test_long_rate": 0.0
+  },
+  {
+    "threshold": 1.5,
+    "val_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "test_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "selection_score": 0.0,
+    "val_long_rate": 0.0,
+    "test_long_rate": 0.0
+  },
+  {
+    "threshold": 2.0,
+    "val_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "test_trading": {
+      "avg_daily_return": 0.0,
+      "cumulative_return": 0.0,
+      "sharpe": 0.0,
+      "hit_ratio": 0.0,
+      "avg_return_in_position": 0.0
+    },
+    "selection_score": 0.0,
+    "val_long_rate": 0.0,
+    "test_long_rate": 0.0
+  }
+]

@@ -23,7 +23,7 @@ from typing import List
 # 1. DATA PATHS
 # ============================
 
-# Folder that contains this experiment (…/project_root/experiment_9b)
+# Folder that contains this experiment (…/project_root/experiment_9c)
 EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Top-level project folder one level above (…/project_root)
@@ -60,13 +60,13 @@ BTC_SENTIMENT_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_sentiment_daily.csv")
 
 # Adjust these if your BTCUSD_hourly.csv covers a different period.
 TRAIN_START_DATE = "2016-01-01"   # first available hourly bar
-TRAIN_END_DATE   = "2022-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
+TRAIN_END_DATE   = "2020-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
 
-VAL_START_DATE   = "2023-01-01"   # recent but separate for tuning / threshold selection
-VAL_END_DATE     = "2023-12-31"
+VAL_START_DATE   = "2021-01-01"   # recent but separate for tuning / threshold selection
+VAL_END_DATE     = "2021-12-31"
 
-TEST_START_DATE  = "2024-01-01"   # most recent, fully out-of-sample regime
-TEST_END_DATE    = "2024-12-31"   # or last available 2024 timestamp
+TEST_START_DATE  = "2022-01-01"   # most recent, fully out-of-sample regime
+TEST_END_DATE    = "2022-12-31"   # or last available 2024 timestamp
 
 
 # ============================
@@ -81,7 +81,8 @@ TEST_END_DATE    = "2024-12-31"   # or last available 2024 timestamp
 # where H = FORECAST_HORIZONS[0] is now measured in *hourly steps* (e.g. 24).
 TRIPLE_DIRECTION_COLUMN: str = "direction_3c"
 
-# Backwards-compatible aliases used across pipeline/train/eval
+# For classification tasks, TARGET_COLUMN is the class label column.
+# For quantile forecasting (9c), targets are multi-horizon return columns (TARGET_RET_COLS).
 TARGET_COLUMN: str = TRIPLE_DIRECTION_COLUMN
 DIRECTION_LABEL_COLUMN: str = TRIPLE_DIRECTION_COLUMN
 
@@ -99,7 +100,7 @@ DIRECTION_THRESHOLD: float = 0.005
 USE_LOG_RETURNS: bool = True
 
 # Task type: "classification" uses direction_3c, "regression" predicts a continuous return/price
-TASK_TYPE: str = "classification"
+TASK_TYPE: str = "quantile_forecast"
 
 
 # ============================
@@ -117,11 +118,18 @@ SEQ_LENGTH: int = 96  # 96 hourly bars of history (~4 days)
 # this means "next 24 hours" as the prediction horizon.
 FORECAST_HORIZONS: List[int] = [24]
 
+QUANTILES: List[float] = [0.1, 0.5, 0.9]
+N_QUANTILES: int = len(QUANTILES)
+
 # Canonical single-horizon convenience variable (useful when you want one H everywhere).
 # For now, this equals FORECAST_HORIZONS[0].
 if len(FORECAST_HORIZONS) < 1:
     raise ValueError("FORECAST_HORIZONS must contain at least one horizon step.")
 FORECAST_HORIZON: int = FORECAST_HORIZONS[0]
+
+# Multi-horizon regression targets (Experiment 9c)
+TARGET_RET_PREFIX: str = "y_ret_"
+TARGET_RET_COLS: List[str] = [f"{TARGET_RET_PREFIX}{h}" for h in range(1, FORECAST_HORIZON + 1)]
 
 # Daily feature availability control:
 # When merging daily on-chain/sentiment into hourly bars at timestamp t, use day (t - lag_days)
@@ -138,23 +146,6 @@ DROP_LAST_H_IN_EACH_SPLIT: bool = True
 
 # Convenience flag: True if we are in a genuine multi-horizon setup.
 USE_MULTI_HORIZON: bool = len(FORECAST_HORIZONS) > 1
-
-# -----------------------------
-# Experiment 9a: data integrity knobs
-# -----------------------------
-
-# Convenience: canonical horizon (useful everywhere; equals first horizon)
-if len(FORECAST_HORIZONS) < 1:
-    raise ValueError("FORECAST_HORIZONS must contain at least one horizon.")
-FORECAST_HORIZON: int = FORECAST_HORIZONS[0]
-
-# Daily feature availability: when merging daily on-chain/sentiment into hourly rows at time t,
-# use day (t - lag_days) to reflect that daily aggregates are only known after day close.
-DAILY_FEATURE_LAG_DAYS: int = 1
-
-# Enable sanity checks in data_pipeline (split-boundary + daily-lag verification)
-DEBUG_DATA_INTEGRITY: bool = True
-
 
 # -------- Core price & indicator features (past covariates) --------
 
@@ -300,8 +291,9 @@ MODEL_CONFIG = ModelConfig()
 
 # Make sure the final layer has the right size for the active task
 if TASK_TYPE == "classification":
-    # 3-class UP / FLAT / DOWN for the H-step-ahead direction.
     MODEL_CONFIG.output_size = NUM_CLASSES
+elif TASK_TYPE == "quantile_forecast":
+    MODEL_CONFIG.output_size = FORECAST_HORIZON * N_QUANTILES
 
 
 # ============================
@@ -381,6 +373,35 @@ UP_THRESHOLD_GRID = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
 
 # Metric to use when selecting τ* from UP_THRESHOLD_GRID on the validation set.
 THRESHOLD_SELECTION_METRIC: str = "sharpe"
+
+SIGNAL_HORIZON: int = FORECAST_HORIZON     # which step you trade on (use 24 first)
+SCORE_EPS: float = 1e-6                    # for mu/(iqr+eps)
+SCORE_GRID = [0.055, 0.060, 0.0625, 0.065, 0.0675, 0.070, 0.0725, 0.075, 0.080]
+
+# ----------------------------
+# ACTIVE signal-threshold settings (foolproof)
+# ----------------------------
+# These are the ONLY variables evaluation should use going forward.
+# They select the correct signal + grid depending on TASK_TYPE.
+
+if TASK_TYPE == "classification":
+    ACTIVE_SIGNAL_NAME: str = "p_up"
+    ACTIVE_THRESHOLD_GRID = UP_THRESHOLD_GRID
+    ACTIVE_SELECTION_METRIC: str = THRESHOLD_SELECTION_METRIC
+    ACTIVE_AUTO_TUNE: bool = AUTO_TUNE_THRESHOLD
+elif TASK_TYPE == "quantile_forecast":
+    ACTIVE_SIGNAL_NAME: str = "score"
+    ACTIVE_THRESHOLD_GRID = SCORE_GRID
+    ACTIVE_SELECTION_METRIC: str = "sharpe"  # keep consistent with your outline
+    ACTIVE_AUTO_TUNE: bool = True
+else:
+    raise ValueError(f"Unsupported TASK_TYPE: {TASK_TYPE}")
+
+if TASK_TYPE == "quantile_forecast":
+    # Guardrail: if someone accidentally tries to use classification-only thresholding
+    # in quantile mode, they should notice immediately.
+    assert ACTIVE_SIGNAL_NAME == "score"
+    assert ACTIVE_THRESHOLD_GRID == SCORE_GRID
 
 # ----------------------------
 # Trading / evaluation options
