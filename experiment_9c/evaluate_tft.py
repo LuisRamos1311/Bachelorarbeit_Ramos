@@ -1151,24 +1151,133 @@ def main() -> None:
             f"p95 CumRet={random_baseline_test['cumulative_return_p95']:.4f}"
         )
 
-        # --- Plots: score histograms (reuse existing histogram util) ---
-        val_hist_path = os.path.join(PLOTS_DIR, f"{eval_id}_val_score_hist.png")
-        utils.plot_probability_histogram(
-            y_prob=score_val,  # yes, it's a score now; function is just a histogram helper
-            out_path=val_hist_path,
-            threshold=thr_star,
-            title=f"Val score histogram (mu/iqr), signal={signal_h}",
-        )
-        print(f"[evaluate_tft] Validation score histogram saved to {val_hist_path}")
+        # ------------------------------------------------------------------
+        # 9c Reporting pack: replace score histograms
+        # ------------------------------------------------------------------
 
-        test_hist_path = os.path.join(PLOTS_DIR, f"{eval_id}_test_score_hist.png")
-        utils.plot_probability_histogram(
-            y_prob=score_test,
-            out_path=test_hist_path,
-            threshold=thr_star,
-            title=f"Test score histogram (mu/iqr), signal={signal_h}",
+        # Step 2.1 — Create 4 plot file paths (we generate the first two in Steps 2.2–2.3)
+        forecast_band_path = os.path.join(PLOTS_DIR, f"{eval_id}_test_forecast_band.png")
+        threshold_sweep_plot_path = os.path.join(PLOTS_DIR, f"{eval_id}_threshold_sweep.png")
+        equity_curve_path = os.path.join(PLOTS_DIR, f"{eval_id}_test_equity_curve.png")
+        signal_confusion_path = os.path.join(PLOTS_DIR, f"{eval_id}_test_signal_confusion.png")
+
+        # Step 2.2 — Build the forecast series for plotting (test only, at signal horizon)
+        y_true_sig = y_test_true[:, signal_idx]
+        y_pred_sig_q = y_test_pred[:, signal_idx, :]  # (N, Q)
+
+        utils.plot_quantile_forecast_band(
+            y_true=y_true_sig,
+            y_pred_q=y_pred_sig_q,
+            quantiles=quantiles,
+            out_path=forecast_band_path,
+            title=f"Test forecast band (signal={signal_h})",
+            q_low=0.1,
+            q_mid=0.5,
+            q_high=0.9,
+            window=500,
         )
-        print(f"[evaluate_tft] Test score histogram saved to {test_hist_path}")
+
+        # Step 2.3 — Threshold sweep plot (from existing sweep_records)
+        utils.plot_threshold_sweep(
+            sweep_records=sweep_records,
+            out_path=threshold_sweep_plot_path,
+            title=f"Threshold sweep (val {selection_metric})",
+            selected_threshold=thr_star,
+        )
+
+        # Step 2.4 — Equity curve plot (test only)
+        bh_pos_test = np.ones_like(test_returns_tr, dtype=int)
+        bh_costs_test = utils.apply_costs(
+            bh_pos_test,
+            cost_bps=COST_BPS,
+            slippage_bps=SLIPPAGE_BPS,
+        )
+        bh_equity_test = utils.equity_curve(test_returns_tr, bh_pos_test, bh_costs_test)
+
+        utils.plot_equity_curves(
+            equity_strategy=test_equity,
+            equity_buy_hold=bh_equity_test,
+            out_path=equity_curve_path,
+            title=f"Test equity curves (net)  τ*={thr_star:.3f}",
+        )
+
+        # Step 2.5 — Signal confusion matrix (2×2)
+        y_true_up = (test_returns_tr > 0).astype(int)
+        y_pred_long = (pos_test == 1).astype(int)
+
+        utils.plot_signal_confusion_matrix(
+            actual_up=y_true_up,
+            model_long=y_pred_long,
+            out_path=signal_confusion_path,
+            title=f"Test signal confusion (τ*={thr_star:.3f})",
+        )
+
+        # Step 2.6 — Write the 2 tables
+        forecast_table_path = os.path.join(EXPERIMENTS_DIR, f"{eval_id}_forecast_table.csv")
+        trading_table_path = os.path.join(EXPERIMENTS_DIR, f"{eval_id}_trading_table.csv")
+
+        # Optional: coverage of [q10, q90] at signal horizon on test
+        coverage_q10_q90_test: float | None = None
+        if isinstance(q_idx, dict) and ("q10" in q_idx) and ("q90" in q_idx):
+            q10_i = int(q_idx["q10"])
+            q90_i = int(q_idx["q90"])
+            if 0 <= q10_i < y_pred_sig_q.shape[1] and 0 <= q90_i < y_pred_sig_q.shape[1]:
+                lo = y_pred_sig_q[:, q10_i]
+                hi = y_pred_sig_q[:, q90_i]
+                coverage_q10_q90_test = float(np.mean((y_true_sig >= lo) & (y_true_sig <= hi)))
+
+        # Number of long trades (non-overlapping if NON_OVERLAPPING_TRADES is enabled)
+        n_trades_val = int(np.sum(pos_val == 1))
+        n_trades_test = int(np.sum(pos_test == 1))
+
+        # Forecast table: val/test pinball + MAE@signal (+ optional test coverage)
+        forecast_rows = [
+            {
+                "split": "val",
+                "H": int(H),
+                "signal_horizon": int(signal_h),
+                "pinball": float(val_pinball),
+                "mae_at_signal": float(val_mae),
+            },
+            {
+                "split": "test",
+                "H": int(H),
+                "signal_horizon": int(signal_h),
+                "pinball": float(test_pinball),
+                "mae_at_signal": float(test_mae),
+                "coverage_q10_q90": coverage_q10_q90_test if coverage_q10_q90_test is not None else "",
+            },
+        ]
+        utils.save_table_csv(forecast_rows, forecast_table_path)
+
+        # Trading table: τ*, long-rate, net Sharpe/MDD/CumRet, hit-rate, number of trades (val/test)
+        trading_rows = [
+            {
+                "split": "val",
+                "tau_star": float(thr_star),
+                "signal_horizon": int(signal_h),
+                "long_rate": float(val_long_rate),
+                "n_trades": n_trades_val,
+                "sharpe_net": float(strategy_net_val.get("sharpe", 0.0)),
+                "max_drawdown_net": float(strategy_net_val.get("max_drawdown", 0.0)),
+                "cumulative_return_net": float(strategy_net_val.get("cumulative_return", 0.0)),
+                "hit_rate_net": float(strategy_net_val.get("hit_rate", 0.0)),
+                "avg_trade_return_net": float(strategy_net_val.get("avg_trade_return", 0.0)),
+            },
+            {
+                "split": "test",
+                "tau_star": float(thr_star),
+                "signal_horizon": int(signal_h),
+                "long_rate": float(test_long_rate),
+                "n_trades": n_trades_test,
+                "sharpe_net": float(strategy_net_test.get("sharpe", 0.0)),
+                "max_drawdown_net": float(strategy_net_test.get("max_drawdown", 0.0)),
+                "cumulative_return_net": float(strategy_net_test.get("cumulative_return", 0.0)),
+                "hit_rate_net": float(strategy_net_test.get("hit_rate", 0.0)),
+                "avg_trade_return_net": float(strategy_net_test.get("avg_trade_return", 0.0)),
+            },
+        ]
+        utils.save_table_csv(trading_rows, trading_table_path)
 
         # --- Save outputs ---
         metrics_out.update(
@@ -1206,7 +1315,6 @@ def main() -> None:
 
         sweep_path = os.path.join(EXPERIMENTS_DIR, f"{eval_id}_score_threshold_sweep.json")
         utils.save_json(sweep_records, sweep_path)
-        print(f"[evaluate_tft] Threshold sweep saved to {sweep_path}")
 
     else:
         raise NotImplementedError(
@@ -1218,8 +1326,39 @@ def main() -> None:
     # ------------------------------------------------------------------
     metrics_path = os.path.join(EXPERIMENTS_DIR, f"{eval_id}_metrics.json")
     utils.save_json(metrics_out, metrics_path)
-    print(f"[evaluate_tft] Metrics saved to {metrics_path}")
+    if TASK_TYPE == "quantile_forecast":
+        print("[evaluate_tft] 9c summary (quantile_forecast)")
 
+        cov_txt = f", coverage_q10_q90={coverage_q10_q90_test:.3f}" if coverage_q10_q90_test is not None else ""
+        print(
+            f"  Forecast: val pinball={val_pinball:.6f}, MAE@{signal_h}={val_mae:.6f} | "
+            f"test pinball={test_pinball:.6f}, MAE@{signal_h}={test_mae:.6f}{cov_txt}"
+        )
+
+        print(
+            f"  Trading (net, test): τ*={thr_star:.3f}, long_rate={test_long_rate:.3f}, trades={n_trades_test} | "
+            f"Sharpe={strategy_net_test['sharpe']:.4f}, MDD={strategy_net_test['max_drawdown']:.4f}, "
+            f"CumRet={strategy_net_test['cumulative_return']:.4f}, Hit={strategy_net_test['hit_rate']:.3f}"
+        )
+        print(
+            f"  Buy&Hold (net, test): Sharpe={buy_hold_net_test['sharpe']:.4f}, "
+            f"MDD={buy_hold_net_test['max_drawdown']:.4f}, CumRet={buy_hold_net_test['cumulative_return']:.4f}"
+        )
+
+        print("  Saved artifacts:")
+        for p in [
+            forecast_band_path,
+            threshold_sweep_plot_path,
+            equity_curve_path,
+            signal_confusion_path,
+            forecast_table_path,
+            trading_table_path,
+            sweep_path,
+            metrics_path,
+        ]:
+            print(f"    - {p}")
+    else:
+        print(f"[evaluate_tft] Metrics saved to {metrics_path}")
 
 if __name__ == "__main__":
     main()

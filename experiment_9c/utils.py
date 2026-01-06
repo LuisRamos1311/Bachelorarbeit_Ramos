@@ -1010,6 +1010,310 @@ def plot_probability_histogram(
     fig.savefig(out_path)
     plt.close(fig)
 
+# ============================================================
+# 8. REPORTING PACK HELPERS (Experiment 9c)
+# ============================================================
+
+def save_table_csv(rows: Sequence[Dict[str, Any]], out_path: str) -> None:
+    """
+    Save a list of dictionaries as a CSV table.
+
+    This is intentionally lightweight (no pandas dependency) because it is
+    meant for thesis/report artifacts.
+
+    Args:
+        rows:
+            Sequence of row dicts. All keys found across all rows become
+            columns in the CSV.
+        out_path:
+            Output CSV path.
+    """
+    if rows is None:
+        raise ValueError("rows must not be None")
+    rows_list = list(rows)
+    if len(rows_list) == 0:
+        raise ValueError("rows is empty; refusing to write an empty table.")
+
+    # Collect columns in a stable order: keys of first row, then any new keys in later rows
+    fieldnames: list[str] = []
+    seen = set()
+    for k in rows_list[0].keys():
+        fieldnames.append(str(k))
+        seen.add(str(k))
+
+    for r in rows_list[1:]:
+        for k in r.keys():
+            ks = str(k)
+            if ks not in seen:
+                fieldnames.append(ks)
+                seen.add(ks)
+
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        import csv  # local import keeps top-level import changes minimal
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows_list:
+            # Convert numpy scalars to Python scalars for nicer CSV output
+            clean_row = {}
+            for k in fieldnames:
+                v = r.get(k, "")
+                if isinstance(v, (np.generic,)):
+                    v = v.item()
+                clean_row[k] = v
+            writer.writerow(clean_row)
+
+
+def save_table_markdown(rows: Sequence[Dict[str, Any]], out_path: str) -> None:
+    """
+    Save a list of dictionaries as a Markdown table.
+
+    Useful for pasting directly into a thesis/report.
+    """
+    if rows is None:
+        raise ValueError("rows must not be None")
+    rows_list = list(rows)
+    if len(rows_list) == 0:
+        raise ValueError("rows is empty; refusing to write an empty table.")
+
+    # Stable column order
+    cols: list[str] = []
+    seen = set()
+    for k in rows_list[0].keys():
+        cols.append(str(k))
+        seen.add(str(k))
+    for r in rows_list[1:]:
+        for k in r.keys():
+            ks = str(k)
+            if ks not in seen:
+                cols.append(ks)
+                seen.add(ks)
+
+    def _fmt(v: Any) -> str:
+        if isinstance(v, (np.generic,)):
+            v = v.item()
+        if isinstance(v, float):
+            # Keep markdown readable; evaluation scripts can override precision if needed
+            return f"{v:.6g}"
+        return str(v)
+
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+    body = []
+    for r in rows_list:
+        body.append("| " + " | ".join(_fmt(r.get(c, "")) for c in cols) + " |")
+
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join([header, sep] + body) + "\n")
+
+
+def plot_quantile_forecast_band(
+    y_true: Any,
+    y_pred_q: Any,
+    quantiles: Sequence[float],
+    out_path: str,
+    title: str = "Forecast band",
+    q_low: float = 0.1,
+    q_mid: float = 0.5,
+    q_high: float = 0.9,
+    window: int | None = 500,
+) -> None:
+    """
+    Plot actual series against predicted median with a (q_low, q_high) uncertainty band.
+
+    Expected shapes:
+      - y_true: (N,)
+      - y_pred_q: (N, Q)  where Q = len(quantiles)
+
+    If window is provided, plot only the LAST `window` points to keep figures readable.
+    """
+    y_true_arr = _to_numpy_1d(y_true)
+
+    if isinstance(y_pred_q, torch.Tensor):
+        y_pred_arr = y_pred_q.detach().cpu().numpy()
+    else:
+        y_pred_arr = np.asarray(y_pred_q)
+
+    if y_pred_arr.ndim != 2:
+        raise ValueError(f"y_pred_q must have shape (N,Q), got {y_pred_arr.shape}")
+
+    if y_pred_arr.shape[0] != y_true_arr.shape[0]:
+        raise ValueError(
+            f"y_true and y_pred_q must have same length, got "
+            f"{y_true_arr.shape[0]} vs {y_pred_arr.shape[0]}"
+        )
+
+    low_i = _closest_quantile_index(quantiles, q_low)
+    mid_i = _closest_quantile_index(quantiles, q_mid)
+    high_i = _closest_quantile_index(quantiles, q_high)
+
+    y_low = y_pred_arr[:, low_i]
+    y_mid = y_pred_arr[:, mid_i]
+    y_high = y_pred_arr[:, high_i]
+
+    if window is not None and window > 0 and y_true_arr.shape[0] > window:
+        y_true_arr = y_true_arr[-window:]
+        y_low = y_low[-window:]
+        y_mid = y_mid[-window:]
+        y_high = y_high[-window:]
+
+    x = np.arange(y_true_arr.shape[0])
+
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(x, y_true_arr, label="Actual")
+    ax.plot(x, y_mid, label=f"Pred q{q_mid:g}")
+    ax.fill_between(x, y_low, y_high, alpha=0.2, label=f"Band q{q_low:g}–q{q_high:g}")
+
+    ax.set_title(title)
+    ax.set_xlabel("Time index (windowed)")
+    ax.set_ylabel("Return")
+    ax.legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_threshold_sweep(
+    sweep_records: Sequence[Dict[str, Any]],
+    out_path: str,
+    title: str = "Threshold sweep",
+    selected_threshold: float | None = None,
+) -> None:
+    """
+    Plot threshold sweep results.
+
+    This supports BOTH sweep record formats used in your project:
+      - classification (9b): records contain "val_binary"/"test_binary"
+      - quantile score sweep (9c): records contain "selection_score" + optional "val_long_rate"
+
+    The y-axis is the sweep 'selection_score' (computed in evaluate_tft.py).
+    If 'val_long_rate' is present, it is plotted on a secondary axis.
+    """
+    if sweep_records is None:
+        raise ValueError("sweep_records must not be None")
+    recs = list(sweep_records)
+    if len(recs) == 0:
+        raise ValueError("sweep_records is empty; nothing to plot.")
+
+    thr = np.asarray([float(r["threshold"]) for r in recs], dtype=float)
+    score = np.asarray([float(r.get("selection_score", np.nan)) for r in recs], dtype=float)
+
+    val_long_rate = np.asarray(
+        [float(r.get("val_long_rate", np.nan)) for r in recs],
+        dtype=float,
+    )
+
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    fig, ax1 = plt.subplots(figsize=(8, 4))
+    ax1.plot(thr, score, marker="o", label="Selection score")
+    ax1.set_xlabel("Threshold")
+    ax1.set_ylabel("Selection score")
+    ax1.set_title(title)
+
+    # Optional overlay: validation long-rate if present (9c)
+    if np.isfinite(val_long_rate).any():
+        ax2 = ax1.twinx()
+        ax2.plot(thr, val_long_rate, marker="x", linestyle="--", label="Val long-rate")
+        ax2.set_ylabel("Val long-rate")
+        # Build a combined legend
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc="best")
+    else:
+        ax1.legend(loc="best")
+
+    if selected_threshold is not None:
+        ax1.axvline(float(selected_threshold), linestyle="--", label="Selected threshold")
+        # Re-draw legend to include the vline label
+        handles, labels = ax1.get_legend_handles_labels()
+        ax1.legend(handles, labels, loc="best")
+
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_equity_curves(
+    equity_strategy: Any,
+    equity_buy_hold: Any,
+    out_path: str,
+    title: str = "Equity curves (net)",
+) -> None:
+    """
+    Plot net equity curve of the strategy vs buy&hold (both as growth of $1).
+
+    Args:
+        equity_strategy: (N,) equity values
+        equity_buy_hold: (N,) equity values
+    """
+    eq_s = _to_numpy_1d(equity_strategy).astype(float)
+    eq_b = _to_numpy_1d(equity_buy_hold).astype(float)
+
+    if eq_s.shape != eq_b.shape:
+        raise ValueError(f"Equity curves must have same shape, got {eq_s.shape} vs {eq_b.shape}")
+
+    x = np.arange(eq_s.shape[0])
+
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(x, eq_s, label="Strategy (net)")
+    ax.plot(x, eq_b, label="Buy & hold (net)")
+    ax.set_title(title)
+    ax.set_xlabel("Time index")
+    ax.set_ylabel("Equity (growth of $1)")
+    ax.legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+def plot_signal_confusion_matrix(
+    actual_up: Any,
+    model_long: Any,
+    out_path: str,
+    title: str = "Signal confusion (Actual up? vs Model long?)",
+) -> None:
+    """
+    2x2 confusion matrix for the trading signal:
+      - actual_up: 1 if realized forward return > 0, else 0
+      - model_long: 1 if strategy takes a long position, else 0
+
+    Note: This is NOT a symmetric classifier confusion matrix. We use the
+    standard confusion-matrix plot for a quick 2x2 diagnostic.
+    """
+    y_true = _to_numpy_1d(actual_up).astype(int)
+    y_pred = _to_numpy_1d(model_long).astype(int)
+
+    if y_true.shape != y_pred.shape:
+        raise ValueError(
+            f"actual_up and model_long must have the same shape, got {y_true.shape} vs {y_pred.shape}"
+        )
+
+    plot_confusion_matrix(
+        y_true=y_true,
+        y_pred=y_pred,
+        out_path=out_path,
+        class_names=["No", "Yes"],
+        title=title,
+    )
 
 def save_json(data: Dict[str, Any], path: str) -> None:
     """

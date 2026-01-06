@@ -487,13 +487,16 @@ def main() -> None:
     history_path = os.path.join(EXPERIMENTS_DIR, f"{run_id}_history.json")
     with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
-    print(f"[train_tft] History saved to {history_path}")
 
     # Plot training curves
     curves_path = os.path.join(PLOTS_DIR, f"{run_id}_training_curves.png")
     utils.plot_training_curves(history, curves_path)
-    print(f"[train_tft] Training curves saved to {curves_path}")
 
+    # Compact artifacts summary (no logic changes)
+    print("\n[train_tft] Artifacts summary:")
+    print(f"  Best checkpoint: {best_model_path}")
+    print(f"  History JSON:    {history_path}")
+    print(f"  Training curves: {curves_path}")
 
 if __name__ == "__main__":
     main()
