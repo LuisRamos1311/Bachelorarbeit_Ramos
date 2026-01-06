@@ -18,9 +18,9 @@ import time
 import json
 import matplotlib.patheffects as pe
 from typing import Any, Dict, Sequence, Optional, Tuple
-
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -31,7 +31,6 @@ from sklearn.metrics import (
     roc_curve,
     balanced_accuracy_score,
 )
-import matplotlib.pyplot as plt
 
 
 # ============================================================
@@ -437,21 +436,25 @@ def compute_trading_metrics(
     else:
         sharpe = 0.0
 
-    # Hit ratio: fraction of days with positive strategy return
-    hit_ratio = float((strat_r > 0).mean())
+    # In-position mask (works for long-only and long/short: position != 0)
+    in_pos = (p != 0)
+    in_position_rate = float(in_pos.mean())
 
-    # Average return on days where we are actually in position
-    if np.any(p == 1):
-        avg_in_position = float(strat_r[p == 1].mean())
+    # Hit ratio (ONLY when in a position) — avoids counting "no-trade" zeros
+    if in_pos.any():
+        hit_ratio = float((strat_r[in_pos] > 0).mean())
+        avg_return_in_position = float(strat_r[in_pos].mean())
     else:
-        avg_in_position = 0.0
+        hit_ratio = 0.0
+        avg_return_in_position = 0.0
 
     return {
         "avg_daily_return": avg_daily,
         "cumulative_return": cumulative,
         "sharpe": sharpe,
         "hit_ratio": hit_ratio,
-        "avg_return_in_position": avg_in_position,
+        "avg_return_in_position": avg_return_in_position,
+        "in_position_rate": in_position_rate
     }
 
 def _bps_to_return(bps: float) -> float:

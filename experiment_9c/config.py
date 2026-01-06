@@ -18,7 +18,6 @@ import os
 from dataclasses import dataclass, field
 from typing import List
 
-
 # ============================
 # 1. DATA PATHS
 # ============================
@@ -60,13 +59,13 @@ BTC_SENTIMENT_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_sentiment_daily.csv")
 
 # Adjust these if your BTCUSD_hourly.csv covers a different period.
 TRAIN_START_DATE = "2016-01-01"   # first available hourly bar
-TRAIN_END_DATE   = "2022-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
+TRAIN_END_DATE   = "2020-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
 
-VAL_START_DATE   = "2023-01-01"   # recent but separate for tuning / threshold selection
-VAL_END_DATE     = "2023-12-31"
+VAL_START_DATE   = "2021-01-01"   # recent but separate for tuning / threshold selection
+VAL_END_DATE     = "2021-12-31"
 
-TEST_START_DATE  = "2024-01-01"   # most recent, fully out-of-sample regime
-TEST_END_DATE    = "2024-12-31"   # or last available 2024 timestamp
+TEST_START_DATE  = "2022-01-01"   # most recent, fully out-of-sample regime
+TEST_END_DATE    = "2022-12-31"   # or last available 2024 timestamp
 
 
 # ============================
@@ -380,7 +379,7 @@ SCORE_GRID = [0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.045, 0.050, 0.055]
 
 # Percentile grid for score thresholds (values must be between 0.0 and 1.0)
 # Example: 0.90 means “threshold is the 90th percentile of validation scores”
-SCORE_PERCENTILE_GRID = [0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+SCORE_PERCENTILE_GRID = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
 
 # Choose how thresholds are interpreted in quantile mode:
 #   "absolute"   -> use SCORE_GRID values directly

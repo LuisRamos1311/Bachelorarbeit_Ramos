@@ -1,205 +1,173 @@
-# Experiment 9b – Realistic Revenue Evaluation (Costs + Baselines + Drawdown)
+# Experiments 9c: from Direction Classification to Multi‑Horizon Quantile Forecasting (with Percentile Thresholding)
 
-This experiment keeps the **same modeling task, feature set, architecture, and signal construction** as **Experiment 9a** (hourly BTC OHLCV + technical indicators + *lagged* daily on-chain + *lagged* daily sentiment; 24-hour-ahead 3-class direction classification; Sharpe-optimized thresholding with non-overlapping 24h trades).  
+This README documents the evolution from **Experiment 9b** to **Experiment 9c** in `experiment_9c/`:
+- **9b**: 3‑class *direction* classification (`DOWN / FLAT / UP`) + an *UP-vs-REST* trading signal tuned by threshold sweep.
+- **9c**: **multi‑horizon quantile regression** (uncertainty‑aware forecasting) + a **score-based trading signal** derived from predicted median and spread.
+- **Update**: **percentile‑based thresholds** for 9c so threshold tuning stays comparable across different years/regimes.
 
-**Experiment 9b focus:** make the **revenue/backtest evaluation “paper defensible”** by adding:
-1) **Transaction costs + slippage (net-of-cost backtest)**  
-2) **Buy & Hold baseline** (same return stream)  
-3) **Random exposure baseline** (same long-rate as the strategy)  
-4) **Max drawdown (MDD)** + crypto-appropriate Sharpe annualization (**365**)
-
-> Important context: The test set is **2024**, which was a very strong year for BTC. This makes **Buy & Hold unusually hard to beat** in cumulative return, and it’s why baselines are essential to interpret “strategy alpha”.
+The goal is to have a **fair comparison** between models (9b vs 9c) and across regimes (a “good” test year vs a “bad” test year).
 
 ---
 
-## 1. Motivation
+## 1) What changed from 9b to 9c?
 
-In 9a we fixed two critical realism issues:
-- **Split-first labels** (no split-boundary contamination)
-- **Daily feature lag (t−1 day)** for on-chain and sentiment availability
+### Experiment 9b (baseline)
+**Task:** 3‑class classification of the 24h‑ahead move:
+- Labels are created using log returns (or returns) over **24 hours** and a direction threshold `DIRECTION_THRESHOLD=0.005` (±0.5%).
+- Model outputs class probabilities.
+- For trading, we focus on the probability of **UP**, i.e. `P(up)`.
 
-However, even with improved data integrity, any “revenue” claim is incomplete without:
-- **Trading frictions** (fees + slippage)
-- **Benchmarks** (Buy & Hold and random exposure)
-- **Risk metrics** beyond Sharpe (e.g., Max Drawdown)
+**Trading signal (9b):**
+1. Compute `P(up)` on validation.
+2. Sweep a grid of probability thresholds `τ` (e.g., 0.35 … 0.65).
+3. Select `τ*` that maximizes **validation Sharpe**.
+4. Apply `τ*` on test for a long‑only strategy (non‑overlapping trades at horizon=24h).
 
-Experiment 9b adds these evaluation layers while preserving the model and prediction pipeline unchanged, so results remain comparable.
+### Experiment 9c (new goal)
+**Task:** **multi‑horizon quantile regression** (H=24 horizons, quantiles = 0.1 / 0.5 / 0.9).
+- Instead of “UP/DOWN/FLAT”, the model predicts a **distribution** of future returns:
+  - `q10`, `q50` (median), `q90` for each horizon.
+- Forecast loss: **pinball loss** (quantile loss).
 
----
+**Trading score (9c):** use uncertainty to scale the signal  
+For the chosen trading horizon (24h‑ahead), define:
+- `μ = q50` (median predicted return)
+- `IQR = q90 − q10`
+- **score = μ / (IQR + ε)**
 
-## 2. Data, Date Ranges & Splits (Same as 9a)
-
-- **Frequency:** BTCUSD 1-hour candles  
-- **Modeling window:** 2016-01-01 to 2024-12-31  
-- Splits:
-  - **Train:** 2016 → 2022  
-  - **Validation:** 2023  
-  - **Test (out-of-sample):** 2024  
-
-### Split-boundary enforcement (H = 24)
-Targets are computed inside each split and the **last 24 hours of each split are dropped**, ensuring no label references data beyond the split end.
-
----
-
-## 3. Features & Labels (Same as 9a)
-
-### Past covariates (25 total)
-- Price/volume (MinMax scaled): `open, high, low, close, volume_btc, volume_usd`
-- Technical indicators (StandardScaler): `roc_10, atr_14, macd, macd_signal, macd_hist, rsi_14`
-- On-chain (daily → hourly, lagged by 1 day, StandardScaler):
-  - `aa_ma_ratio, tx_ma_ratio, mvrv_z, sopr_z, hash_ma_ratio`
-- Sentiment (daily → hourly, lagged by 1 day):
-  - Reddit: `reddit_sent_mean, reddit_sent_std, reddit_pos_ratio, reddit_neg_ratio, reddit_volume_log`
-  - Fear & Greed: `fg_index_scaled, fg_change_1d, fg_missing`
-
-### Label / target
-- **Task:** 24-hour-ahead **3-class direction** (classification)
-- Log returns: `USE_LOG_RETURNS = True`
-- Threshold: `DIRECTION_THRESHOLD = 0.005`
-- `direction_3c`:
-  - 0 = DOWN if future log return < –0.005  
-  - 1 = FLAT if |future log return| ≤ 0.005  
-  - 2 = UP if future log return > +0.005  
+This behaves like a “risk‑adjusted predicted return”: large positive median with tight spread → higher score.
 
 ---
 
-## 4. Model & Training Setup (Same as 9a)
+## 2) Why percentile thresholds were added in 9c
 
-- Temporal Fusion Transformer–inspired architecture
-- Hidden size: 32
-- Dropout: 0.3 (GRNs)
-- Weight decay: 5e-4
-- Sequence length: 96 (≈ last 4 days)
-- Loss: CrossEntropyLoss
-- Model selection: best **validation macro-F1** (3-class)
+With absolute score thresholds, the “right” number is **not stable across years** because the score distribution shifts.
+Example from your runs:
+- 2022 scores are around **0.06–0.075**
+- 2024 scores are around **0.025–0.045**
 
----
+So a fixed grid like `[0.015, 0.02, …]` might be **too low** in one year (making you almost always long) and too high in another.
 
-## 5. Evaluation & Trading Logic (Extended in 9b)
+### Percentile thresholding (9c update)
+Instead of defining a fixed list of score thresholds, we define a list of **percentiles** on the **validation score distribution**, for example:
 
-### 5.1 Prediction metrics (unchanged)
-- 3-class metrics: accuracy, precision/recall/F1, AUC
-- UP-vs-REST derived from softmax `P(UP)`
+- 2024 run: `[0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]`
+- 2022 run: `[0.10, 0.20, …, 0.95]`
 
-### 5.2 Strategy signal (unchanged)
-- Long-only: enter long if `P(UP) ≥ τ`, else flat
-- **Non-overlapping trades:** hold for 24h per decision (aligned to the label horizon)
-- Threshold sweep grid:
-  `{0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65}`
-- Choose **τ\*** maximizing **validation Sharpe**
+The evaluation script converts those percentiles into actual thresholds:
+- `τ_p = percentile(score_val, p)`
+- then runs the threshold sweep over `{τ_p}` and picks the best `τ*` by validation Sharpe.
 
-### 5.3 New in 9b: Net-of-cost backtest
-We apply costs when position changes:
-- **Cost = 5 bps**
-- **Slippage = 2 bps**
-- Total friction per entry/exit event ≈ **7 bps**
-
-Reported metrics include:
-- Net cumulative return
-- Net Sharpe (annualized with **365**)
-- Max drawdown (MDD)
-
-### 5.4 New baselines (crucial for interpretation)
-1) **Buy & Hold (net)** on the same return stream  
-2) **Random exposure baseline**: random long/flat with the **same long-rate** as the strategy
-   - report p95 Sharpe and p95 cumulative return (test)
+**Benefit:** “top X% of scores” is comparable across years and avoids accidental “always long” thresholds.
 
 ---
 
-## 6. Results
+## 3) Which metrics JSON for 9b is which?
 
-### 6.1 3-class direction (multi-class)
+You uploaded two 9b `*_metrics.json` files. They correspond to different evaluation runs (different years):
 
-**Validation (2023)**
-- CE loss: 1.4941  
-- Accuracy: 0.3777  
-- Macro-F1: **0.3651**  
-- AUC: 0.5328  
+- **2024 split (train→2022, val=2023, test=2024)**  
+  File: `4f9955e4-c2d3-469c-8eef-0789e2304cf4.json`  
+  Contains `eval_id = tft_eval_20260104_184138` and has **positive Buy&Hold test performance** (bull-ish year).
 
-**Test (2024)**
-- CE loss: 1.6265  
-- Accuracy: 0.3702  
-- Macro-F1: **0.3058**  
-- AUC: 0.5054  
-
-**Interpretation**
-- Multi-class generalization remains challenging (especially FLAT class).
-- The main purpose of 9b is not improving predictive metrics, but improving how “revenue performance” is measured and judged.
+- **2022 split (train→2020, val=2021, test=2022)**  
+  File: `b5714d8a-0378-404c-9be5-5b6f06db6f67.json`  
+  Contains `eval_id = tft_eval_20260105_181946` and has **negative Buy&Hold test performance** (bear-ish year).
 
 ---
 
-### 6.2 UP-vs-REST threshold selection (τ\* by validation Sharpe)
+## 4) Results: 9b vs 9c on a “bad year” (2022) and a “good year” (2024)
 
-- Selected threshold: **τ\* = 0.45**
-- Validation Sharpe score (gross, annual=365): **2.8115**
+### Key comparison table (net of cost)
+Numbers below use the **net-of-cost** strategy results reported by your evaluation scripts (cost=5bps, slippage=2bps, annual=365).
 
-**UP-vs-REST (test, τ\*)**
-- Precision: 0.4703  
-- Recall: 0.2214  
-- Positive rate (fraction of long decisions): **0.1985**
+| Experiment                            | Test year   |   Val year |   Threshold (tau*) |   Net Sharpe (test) |   Net CumRet (test) |   Buy&Hold Net Sharpe (test) |   Buy&Hold Net CumRet (test) |   Test MC F1 |   Test pinball |   Test MAE@24 |
+|:--------------------------------------|:------------|-----------:|-------------------:|--------------------:|--------------------:|-----------------------------:|-----------------------------:|-------------:|---------------:|--------------:|
+| 9b (classification)                   | 2022 (bear) |       2021 |             0.3500 |             -1.4911 |             -0.6361 |                      -1.5899 |                      -0.7093 |       0.3032 |       nan      |      nan      |
+| 9b (classification)                   | 2024 (bull) |       2023 |             0.4500 |              1.2140 |              0.3845 |                       1.4293 |                       0.8405 |       0.3058 |       nan      |      nan      |
+| 9c (quantile forecast + percentile τ) | 2022 (bear) |       2021 |             0.0711 |              0.1578 |             -0.0162 |                      -1.2803 |                      -0.6398 |     nan      |         0.0061 |        0.0255 |
+| 9c (quantile forecast + percentile τ) | 2024 (bull) |       2023 |             0.0311 |              0.7794 |              0.2233 |                       1.6817 |                       1.1104 |     nan      |         0.0045 |        0.0194 |
 
-**Signal behavior**
-- The model is conservative in 2024: it goes long only ~20% of decision points.
-- This tends to increase precision at the cost of recall.
-
----
-
-### 6.3 Trading metrics (gross, no costs; annual=365)
-
-**Validation**
-- Avg daily return: 0.001970  
-- Cumulative return: 0.9716  
-- Sharpe: **2.8115**  
-- Avg return in position: 0.006026  
-
-**Test (2024)**
-- Avg daily return: 0.001232  
-- Cumulative return: 0.4908  
-- Sharpe: **1.4532**  
-- Avg return in position: 0.005869  
-
-> Note: gross Sharpe is higher than older experiments partly because we now annualize using 365 (crypto), not 252.
+**How to read this table**
+- **9b**: multiclass F1 provides a classification quality snapshot, but trading uses UP‑vs‑REST thresholding.
+- **9c**: pinball/MAE measure forecast quality; trading is based on the score threshold.
 
 ---
 
-### 6.4 Net-of-cost backtest + baselines (NEW in 9b)
+## 5) What changed in 9c after percentile thresholds?
 
-**Assumptions**
-- Cost = **5 bps**, slippage = **2 bps**
-- Annualization = **365**
+Before the percentile update, your threshold tuning could pick thresholds that effectively made the strategy **always in position** (often matching Buy&Hold exactly), which makes the backtest look “great” in bull years and “terrible” in bear years—without proving the model is generating a *selective* signal.
 
-**Strategy (net)**
-- Val: Sharpe=**2.4802**, MDD=**0.1138**, CumRet=**0.8118**
-- Test: Sharpe=**1.2140**, MDD=**0.1896**, CumRet=**0.3845**
+After switching to percentile thresholds, the strategy becomes more selective (higher thresholds), which:
+- **hurts bull-year returns** (less market exposure),
+- but **dramatically reduces bear-year drawdowns** (less exposure when signals are weak).
 
-**Buy & Hold (net)**
-- Val: Sharpe=**2.1200**, MDD=**0.2082**, CumRet=**1.2795**
-- Test: Sharpe=**1.4293**, MDD=**0.3146**, CumRet=**0.8405**
+Here’s the same 9c model family, comparing the earlier “fixed grid picked τ≈0.0 (always long)” behavior vs the new percentile tuning:
 
-**Random exposure baseline (same long-rate as strategy) – Test**
-- p95 Sharpe=**1.8110**
-- p95 CumRet=**0.5045**
-
-**Interpretation (most important conclusion of 9b)**
-- After costs, the strategy remains positive and has **lower drawdown than Buy & Hold** in 2024,
-  but it **does not beat Buy & Hold** in cumulative return or Sharpe on the test year.
-- Because 2024 was a strong BTC year, Buy & Hold is a high bar.
-- The random-exposure baseline shows that some “good-looking” outcomes can occur even with random timing at the same long-rate, so beating baselines (not just having Sharpe > 1) is necessary to claim alpha.
+|   Year | Mode                    |   Net Sharpe |   Net CumRet |   Bh Sharpe |   Bh CumRet |
+|-------:|:------------------------|-------------:|-------------:|------------:|------------:|
+|   2022 | fixed (tau=0.0)         |      -1.2803 |      -0.6398 |     -1.2803 |     -0.6398 |
+|   2022 | percentile (tau*=0.071) |       0.1578 |      -0.0162 |     -1.2803 |     -0.6398 |
+|   2024 | fixed (tau=0.0)         |       1.6817 |       1.1104 |      1.6817 |      1.1104 |
+|   2024 | percentile (tau*=0.031) |       0.7794 |       0.2233 |      1.6817 |      1.1104 |
 
 ---
 
-## 7. Conclusion
+## 6) Interpretation (what this means for “best baseline”)
 
-Experiment 9b upgrades the evaluation into a **realistic revenue framework**:
-- Adds costs/slippage
-- Reports max drawdown
-- Compares against Buy & Hold and random exposure
+### 2024 (good year)
+- **9b** achieves higher net Sharpe than percentile‑9c, but both underperform Buy&Hold in this year.
+- **9c (percentile)** is *not* an “always-long” proxy anymore, so it no longer inherits the full bull-market performance. This is expected and is the price of making the signal meaningful.
 
-Key outcome:
-- The 9a/9b strategy behaves like a **selective long filter** with reduced market exposure and reduced drawdown,
-  but **does not yet demonstrate clear alpha** over Buy & Hold in a strong BTC year (2024).
+### 2022 (bad year)
+- **9b** struggles: net Sharpe ≈ −1.49, large negative cumulative return.
+- **9c (percentile)** is far more robust: it nearly sidesteps the drawdown (net CumRet close to 0) and improves risk-adjusted performance relative to Buy&Hold.
 
-Next steps (Experiment 9c and beyond):
-- Move toward a more “true TFT” setup (multi-horizon + quantiles),
-- Improve calibration and horizon modeling,
-- Re-check alpha under costs across multiple years / walk-forward validation.
+### Recommendation (practical)
+If you must pick **one** baseline for “future updates”:
+
+- Pick **9c + percentile thresholds** if your priority is **robustness across regimes** and a forecasting setup that naturally supports uncertainty, risk controls, and multi‑horizon extensions.
+- Keep **9b** as a *secondary baseline* if your priority is **direction classification**, because it’s easier to interpret and can still produce strong bull-year trading performance.
+
+A good workflow is to track *both*:
+- **Forecasting baseline:** 9c (pinball loss / MAE + calibration)
+- **Directional trading baseline:** 9b (UP-vs-REST trading Sharpe)
+
+---
+
+## 7) Suggested default percentile grids going forward
+
+Your percentile grids were different between the 2022 and 2024 runs. For a single consistent setting, start with:
+
+```python
+PERCENTILES = [0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.975, 0.99]
+```
+
+Why:
+- Covers “moderate selectivity” (0.50–0.80) and “high conviction” (0.90–0.99).
+- Helps you see if performance is stable as you trade less.
+
+---
+
+## 8) How to run
+
+Train:
+```bash
+python train_tft.py
+```
+
+Evaluate:
+```bash
+python evaluate_tft.py
+```
+
+Outputs:
+- `experiment_9c/plots/` – learning curves + score histograms
+- `experiment_9c/experiments/` – `*_metrics.json` + `*_score_threshold_sweep.json`
+
+---
+
+## 9) Notes / caveats
+
+- **Validation year differs** between the “2022 test” run (val=2021) and the “2024 test” run (val=2023). That’s intended in your rolling split setup, but it means `τ*` is tuned on different regimes.
+- Percentile thresholds are computed on **validation scores** (no test leakage). In live trading you may want a *rolling* percentile of recent scores to keep long-rate stable over time.
