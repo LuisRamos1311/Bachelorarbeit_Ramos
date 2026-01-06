@@ -357,6 +357,12 @@ def main() -> None:
     # 2. Build model & load weights
     # ------------------------------------------------------------------
     print(f"[evaluate_tft] Loading model from {BEST_MODEL_PATH} .")
+    # Preflight: refuse to evaluate if no trained checkpoint is present
+    if not os.path.isfile(BEST_MODEL_PATH):
+        raise FileNotFoundError(
+            f"[evaluate_tft] Best model checkpoint not found: {BEST_MODEL_PATH}\n"
+            f"Run train_tft.py first (it should create the checkpoint under the 'standard/models' folder)."
+        )
     model = TemporalFusionTransformer(MODEL_CONFIG).to(device)
 
     # Load best checkpoint (weights only)

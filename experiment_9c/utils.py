@@ -86,6 +86,29 @@ def ensure_dir(path: str) -> None:
     """
     os.makedirs(path, exist_ok=True)
 
+def guard_dir_missing_or_empty(path: str, *, display_name: str = "standard") -> None:
+    """
+    Safety guard:
+    - If `path` does not exist: create it.
+    - If `path` exists and is empty: OK.
+    - If `path` exists and is non-empty: raise (refuse to run).
+    - If `path` exists but is not a directory: raise.
+    """
+    if os.path.exists(path):
+        if not os.path.isdir(path):
+            raise RuntimeError(
+                f"Refusing to run: '{display_name}' path exists but is not a directory: {path}"
+            )
+
+        # Non-empty means *any* entry exists (files, folders, hidden files, etc.)
+        with os.scandir(path) as it:
+            if any(True for _ in it):
+                raise RuntimeError(
+                    f"Refusing to run: '{display_name}' folder already exists and is non-empty: {path}\n"
+                    f"Rename/move it (catalog it) and re-run, so a fresh '{display_name}' can be created."
+                )
+    else:
+        os.makedirs(path, exist_ok=False)
 
 # ============================================================
 # 2. NUMPY CONVERSION HELPER

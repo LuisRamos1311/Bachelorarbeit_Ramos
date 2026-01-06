@@ -31,10 +31,13 @@ PROJECT_ROOT = os.path.dirname(EXPERIMENT_ROOT)
 # Shared data directory at project root
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
-# Experiment-specific output directories
-MODELS_DIR = os.path.join(EXPERIMENT_ROOT, "models")
-EXPERIMENTS_DIR = os.path.join(EXPERIMENT_ROOT, "experiments")
-PLOTS_DIR = os.path.join(EXPERIMENT_ROOT, "plots")
+# Experiment-specific output directories (routed under EXPERIMENT_ROOT/standard/)
+STANDARD_RUN_DIRNAME = "standard"
+STANDARD_RUN_DIR = os.path.join(EXPERIMENT_ROOT, STANDARD_RUN_DIRNAME)
+
+MODELS_DIR = os.path.join(STANDARD_RUN_DIR, "models")
+EXPERIMENTS_DIR = os.path.join(STANDARD_RUN_DIR, "experiments")
+PLOTS_DIR = os.path.join(STANDARD_RUN_DIR, "plots")
 
 # Main BTC daily CSV (CryptoDataDownload-style)
 BTC_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_daily.csv")
@@ -59,13 +62,13 @@ BTC_SENTIMENT_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_sentiment_daily.csv")
 
 # Adjust these if your BTCUSD_hourly.csv covers a different period.
 TRAIN_START_DATE = "2016-01-01"   # first available hourly bar
-TRAIN_END_DATE   = "2022-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
+TRAIN_END_DATE   = "2020-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
 
-VAL_START_DATE   = "2023-01-01"   # recent but separate for tuning / threshold selection
-VAL_END_DATE     = "2023-12-31"
+VAL_START_DATE   = "2021-01-01"   # recent but separate for tuning / threshold selection
+VAL_END_DATE     = "2021-12-31"
 
-TEST_START_DATE  = "2024-01-01"   # most recent, fully out-of-sample regime
-TEST_END_DATE    = "2024-12-31"   # or last available 2024 timestamp
+TEST_START_DATE  = "2022-01-01"   # most recent, fully out-of-sample regime
+TEST_END_DATE    = "2022-12-31"   # or last available 2024 timestamp
 
 
 # ============================

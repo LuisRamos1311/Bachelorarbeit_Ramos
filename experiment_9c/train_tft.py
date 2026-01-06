@@ -240,9 +240,13 @@ def main() -> None:
     device = utils.get_device()
     print(f"[train_tft] Using device: {device}")
 
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
-    os.makedirs(PLOTS_DIR, exist_ok=True)
+    # Safety: refuse to start a new run if "standard" already has content
+    utils.guard_dir_missing_or_empty(cfg.STANDARD_RUN_DIR, display_name=cfg.STANDARD_RUN_DIRNAME)
+
+    # Normal directory creation under standard/
+    utils.ensure_dir(MODELS_DIR)
+    utils.ensure_dir(EXPERIMENTS_DIR)
+    utils.ensure_dir(PLOTS_DIR)
 
     # Derive a human-readable horizon description
     if FORECAST_HORIZONS:
