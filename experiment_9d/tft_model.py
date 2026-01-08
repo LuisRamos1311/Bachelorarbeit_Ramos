@@ -46,18 +46,19 @@ class GatedResidualNetwork(nn.Module):
 
     Shapes:
         x:       (batch, ..., input_size)
-        context: (batch, ..., input_size) or (batch, input_size) or None
+        context: (batch, ..., context_size) or (batch, context_size) or None
 
     Output:
         same shape as x, but with last dimension = output_size
     """
 
     def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        output_size: int | None = None,
-        dropout: float = 0.1,
+            self,
+            input_size: int,
+            hidden_size: int,
+            output_size: int | None = None,
+            dropout: float = 0.1,
+            context_size: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -70,6 +71,13 @@ class GatedResidualNetwork(nn.Module):
 
         # First linear layer maps input (and optional context) to hidden size
         self.linear1 = nn.Linear(input_size, hidden_size)
+
+        # Optional context projection into hidden space (paper-style GRN conditioning)
+        self.context_size = context_size
+        if context_size is not None:
+            self.context_projection = nn.Linear(context_size, hidden_size, bias=False)
+        else:
+            self.context_projection = None
 
         # Second linear layer maps hidden to output dimension
         self.linear2 = nn.Linear(hidden_size, output_size)
@@ -108,20 +116,36 @@ class GatedResidualNetwork(nn.Module):
         # Save residual for later
         residual = x
 
-        # If context is provided and has fewer dimensions, try to unsqueeze it
-        if context is not None:
-            # Example: x: (B, T, D), context: (B, D)
-            # -> unsqueeze context to (B, 1, D) so broadcasting works.
-            if context.dim() == x.dim() - 1:
-                context = context.unsqueeze(1)
-            # Add context to x before non-linearity (simple conditioning)
-            x = x + context
+        # MLP part (paper-style context injection happens in hidden space)
+        h = self.linear1(x)  # (B, ..., hidden_size)
 
-        # MLP part
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.linear2(x)
-        x = self.dropout(x)
+        if context is not None:
+            if self.context_projection is None:
+                raise ValueError(
+                    "GatedResidualNetwork received a context tensor, but was constructed "
+                    "with context_size=None (so no context_projection exists). "
+                    "Construct it with context_size=context.shape[-1]."
+                )
+
+            # Broadcast context across any extra dims (e.g. time) if needed.
+            # Example: h: (B, T, H), context: (B, C) -> (B, 1, C)
+            while context.dim() < h.dim():
+                context = context.unsqueeze(1)
+
+            if context.shape[-1] != self.context_projection.in_features:
+                raise ValueError(
+                    f"Context last dim {context.shape[-1]} does not match "
+                    f"context_size={self.context_projection.in_features} used to "
+                    "construct this GRN."
+                )
+
+            h = h + self.context_projection(context)
+
+        h = self.activation(h)
+        h = self.linear2(h)
+        h = self.dropout(h)
+
+        x = h
 
         # If dimensions do not match, project residual to output_size
         if self.skip_projection is not None:
@@ -161,18 +185,20 @@ class VariableSelectionNetwork(nn.Module):
     """
 
     def __init__(
-        self,
-        num_features: int,
-        hidden_size: int,
-        vsn_hidden_size: int,
-        dropout: float = 0.1,
-        use_gating: bool = True,
+            self,
+            num_features: int,
+            hidden_size: int,
+            vsn_hidden_size: int,
+            context_size: int | None = None,
+            dropout: float = 0.1,
+            use_gating: bool = True,
     ) -> None:
         super().__init__()
 
         self.num_features = num_features
         self.hidden_size = hidden_size
         self.use_gating = use_gating
+        self.context_size = context_size
 
         # Value projection: maps each (B, T, F) vector to (B, T, F * H),
         # then we reshape to (B, T, F, H).
@@ -186,6 +212,7 @@ class VariableSelectionNetwork(nn.Module):
                 hidden_size=vsn_hidden_size,
                 output_size=num_features,
                 dropout=dropout,
+                context_size=context_size,
             )
         else:
             self.weight_network = nn.Sequential(
@@ -197,7 +224,11 @@ class VariableSelectionNetwork(nn.Module):
 
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+            self,
+            x: torch.Tensor,
+            context: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x:
@@ -228,7 +259,11 @@ class VariableSelectionNetwork(nn.Module):
         # ---- Weight network ----
         # Produce logits over features, then softmax.
         # weight_logits: (B, T, F)
-        weight_logits = self.weight_network(x)
+        if self.use_gating:
+            # If weight_network is a GRN, it can consume context (e.g., static_context).
+            weight_logits = self.weight_network(x, context=context)
+        else:
+            weight_logits = self.weight_network(x)
         selection_weights = self.softmax(weight_logits)  # (B, T, F)
 
         # ---- Weighted combination ----
@@ -294,6 +329,44 @@ class TemporalFusionTransformer(nn.Module):
         hidden_size = self.config.hidden_size
         dropout = self.config.dropout
 
+        # -------- 0. Static covariate encoder (Experiment 9d) --------
+        # This does NOT change outputs yet — it only creates the module.
+        # Wiring static_context into the network happens in step 5C.
+        self.use_static = bool(getattr(self.config, "use_static_covariates", False))
+        self.static_encoder: nn.Module | None = None
+        self.static_context_size: int | None = None
+
+        if self.use_static:
+            static_input_size = int(getattr(self.config, "static_input_size", 0))
+            if static_input_size <= 0:
+                raise ValueError(
+                    "use_static_covariates=True but static_input_size <= 0. "
+                    "Check config.STATIC_COLS and ModelConfig.static_input_size."
+                )
+
+            # In your config, static_context_size is set to hidden_size by default.
+            static_context_size = int(getattr(self.config, "static_context_size", hidden_size))
+
+            self.static_context_size = static_context_size
+
+            if self.config.use_gating:
+                # Paper-style: StaticEncoder = GRN(static_inputs) -> static_context
+                # Produces: static_context shape (B, static_context_size) (typically == hidden_size).
+                self.static_encoder = GatedResidualNetwork(
+                    input_size=static_input_size,
+                    hidden_size=self.config.variable_selection_hidden_size,
+                    output_size=static_context_size,
+                    dropout=dropout,
+                    context_size=None,
+                )
+            else:
+                # If gating is disabled, keep it simple (still produces a static context vector).
+                self.static_encoder = nn.Sequential(
+                    nn.Linear(static_input_size, static_context_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
+
         # -------- 1. Input handling: VSN or linear projection --------
         # Plain linear projection (used when variable selection is disabled).
         self.input_projection = nn.Linear(
@@ -307,6 +380,7 @@ class TemporalFusionTransformer(nn.Module):
             num_features=self.config.input_size,
             hidden_size=hidden_size,
             vsn_hidden_size=self.config.variable_selection_hidden_size,
+            context_size=self.static_context_size,
             dropout=dropout,
             use_gating=self.config.use_gating,
         )
@@ -356,6 +430,7 @@ class TemporalFusionTransformer(nn.Module):
                 hidden_size=self.config.variable_selection_hidden_size,
                 output_size=hidden_size,
                 dropout=dropout,
+                context_size=self.static_context_size,
             )
 
             self.attn_grn = GatedResidualNetwork(
@@ -363,6 +438,7 @@ class TemporalFusionTransformer(nn.Module):
                 hidden_size=self.config.variable_selection_hidden_size,
                 output_size=hidden_size,
                 dropout=dropout,
+                context_size=self.static_context_size,
             )
 
             self.temporal_ffn_grn = GatedResidualNetwork(
@@ -370,7 +446,9 @@ class TemporalFusionTransformer(nn.Module):
                 hidden_size=self.config.ff_hidden_size,
                 output_size=hidden_size,
                 dropout=dropout,
+                context_size=self.static_context_size,
             )
+
         else:
             # Simpler feed-forward network with residual + LayerNorm
             self.ffn = nn.Sequential(
@@ -392,7 +470,9 @@ class TemporalFusionTransformer(nn.Module):
                     hidden_size=self.config.variable_selection_hidden_size,
                     output_size=hidden_size,
                     dropout=dropout,
+                    context_size=self.static_context_size,
                 )
+
             else:
                 # Simple linear projection when gating is disabled
                 self.future_encoder = nn.Sequential(
@@ -410,6 +490,7 @@ class TemporalFusionTransformer(nn.Module):
                 hidden_size=self.config.ff_hidden_size,
                 output_size=hidden_size,
                 dropout=dropout,
+                context_size=hidden_size,
             )
         elif self.config.use_future_covariates and not self.config.use_gating:
             # When gating is off, we'll concatenate and use a linear layer
@@ -427,10 +508,11 @@ class TemporalFusionTransformer(nn.Module):
         self.output_layer = nn.Linear(hidden_size, self.config.output_size)
 
     def forward(
-        self,
-        x_past: torch.Tensor,
-        x_future: torch.Tensor | None = None,
-        return_attention: bool = False,
+            self,
+            x_past: torch.Tensor,
+            x_future: torch.Tensor | None = None,
+            x_static: torch.Tensor | None = None,
+            return_attention: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the TFT model.
@@ -458,6 +540,36 @@ class TemporalFusionTransformer(nn.Module):
         """
         # x_past: (B, T, F)
         batch_size, seq_length, input_size = x_past.shape
+
+        # ---- Static context (Experiment 9d / Step 5C) ----
+        static_context: torch.Tensor | None = None
+
+        if self.use_static:
+            if x_static is None:
+                raise ValueError(
+                    "x_static must be provided when use_static_covariates=True."
+                )
+            if x_static.shape[0] != batch_size:
+                raise ValueError(
+                    f"x_static batch dimension {x_static.shape[0]} does not match "
+                    f"x_past batch dimension {batch_size}."
+                )
+
+            expected_static = int(getattr(self.config, "static_input_size", x_static.shape[1]))
+            if x_static.shape[1] != expected_static:
+                raise ValueError(
+                    f"Expected x_static.shape[1]={expected_static}, but got {x_static.shape[1]}. "
+                    "Check config.STATIC_COLS / ModelConfig.static_input_size."
+                )
+
+            if self.static_encoder is None:
+                raise RuntimeError("use_static_covariates=True but static_encoder is None.")
+
+            # (B, static_context_size) — typically (B, hidden_size)
+            static_context = self.static_encoder(x_static)
+        else:
+            # If static is disabled, ignore any provided x_static to avoid confusion.
+            x_static = None
 
         if input_size != self.config.input_size:
             raise ValueError(
@@ -499,7 +611,7 @@ class TemporalFusionTransformer(nn.Module):
         # ---- Step 1: Variable selection or simple projection ----
         if self.config.use_variable_selection:
             # x_proj: (B, T, H), vsn_weights: (B, T, F)
-            x_proj, vsn_weights = self.vsn_past(x_past)
+            x_proj, vsn_weights = self.vsn_past(x_past, context=static_context)
             # Store for potential interpretability later
             self.last_vsn_weights = vsn_weights
         else:
@@ -515,7 +627,7 @@ class TemporalFusionTransformer(nn.Module):
             # Combine projected input and LSTM output, then pass through GRN.
             # This GRN includes residual + gating + LayerNorm internally.
             enc_input = lstm_out + x_proj
-            enc = self.post_lstm_grn(enc_input)
+            enc = self.post_lstm_grn(enc_input, context=static_context)
         else:
             # Residual connection: add the projected input to the LSTM output.
             # Then apply LayerNorm for stability.
@@ -530,7 +642,7 @@ class TemporalFusionTransformer(nn.Module):
         if self.config.use_gating:
             # Apply a GRN to the attention output. GRN internally handles
             # residual + gating + LayerNorm.
-            attn_out = self.attn_grn(attn_raw)
+            attn_out = self.attn_grn(attn_raw, context=static_context)
         else:
             # Simple residual + LayerNorm when gating is off.
             attn_out = self.attn_layer_norm(attn_raw + enc)
@@ -538,7 +650,7 @@ class TemporalFusionTransformer(nn.Module):
         # ---- Step 4: Temporal feed-forward / gating ----
         if self.config.use_gating:
             # GRN as the temporal feed-forward block.
-            ff_out = self.temporal_ffn_grn(attn_out)
+            ff_out = self.temporal_ffn_grn(attn_out, context=static_context)
         else:
             # Classic MLP + residual + LayerNorm.
             ff_core = self.ffn(attn_out)
@@ -554,7 +666,7 @@ class TemporalFusionTransformer(nn.Module):
         if self.config.use_future_covariates and x_future is not None:
             # Encode future covariates to a context vector: (B, H)
             if self.config.use_gating:
-                future_context = self.future_encoder(x_future)  # GRN encoder
+                future_context = self.future_encoder(x_future, context=static_context)  # GRN encoder
             else:
                 future_context = self.future_encoder(x_future)  # linear encoder
 

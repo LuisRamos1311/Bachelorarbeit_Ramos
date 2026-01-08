@@ -28,6 +28,7 @@ Behaviour:
 """
 
 import os
+import inspect
 from typing import Tuple, Dict, Any, List
 import numpy as np
 import torch
@@ -121,24 +122,57 @@ def create_eval_dataloaders(
 
 def _unpack_batch(batch, device: torch.device):
     """
-    Handle both dataset variants:
+    Handle dataset variants (Experiment 9d adds optional static covariates):
+
       - (x_past, y)
-      - (x_past, x_future, y)
+      - (x_past, x_future, y)            if only future covariates are enabled
+      - (x_past, x_static, y)            if only static covariates are enabled
+      - (x_past, x_future, x_static, y)  if both are enabled (Experiment 9d default)
+
+    Returns:
+        x_past, x_future, x_static, y   (with x_future/x_static possibly None)
     """
+    x_future = None
+    x_static = None
+
     if len(batch) == 2:
         x_past, y = batch
-        x_future = None
-    else:
-        x_past, x_future, y = batch
 
+    elif len(batch) == 3:
+        x_past, x2, y = batch
+
+        # Disambiguate based on config switches (same as train_tft.py)
+        if MODEL_CONFIG.use_future_covariates and not MODEL_CONFIG.use_static_covariates:
+            x_future = x2
+        elif MODEL_CONFIG.use_static_covariates and not MODEL_CONFIG.use_future_covariates:
+            x_static = x2
+        else:
+            raise ValueError(
+                "Got a 3-item batch while BOTH future and static covariates are enabled. "
+                "Expected (x_past, x_future, x_static, y). "
+                "Check BTCTFTDataset.__getitem__() and config flags."
+            )
+
+    elif len(batch) == 4:
+        x_past, x_future, x_static, y = batch
+
+    else:
+        raise ValueError(
+            f"Expected batch of length 2, 3, or 4, got {len(batch)}. "
+            "Check BTCTFTDataset.__getitem__()."
+        )
+
+    # Move to device
     x_past = x_past.to(device)
     y = y.to(device)
 
     if x_future is not None:
         x_future = x_future.to(device)
 
-    return x_past, x_future, y
+    if x_static is not None:
+        x_static = x_static.to(device)
 
+    return x_past, x_future, x_static, y
 
 def run_inference_classification(
     model: nn.Module,
@@ -157,14 +191,20 @@ def run_inference_classification(
     all_true: List[torch.Tensor] = []
     all_prob: List[torch.Tensor] = []
 
+    forward_params = inspect.signature(model.forward).parameters
+    supports_x_static = "x_static" in forward_params
+
     with torch.no_grad():
         for batch in data_loader:
-            x_past, x_future, y = _unpack_batch(batch, device)
+            x_past, x_future, x_static, y = _unpack_batch(batch, device)
 
+            model_kwargs = {}
             if x_future is not None:
-                logits = model(x_past, x_future)
-            else:
-                logits = model(x_past)
+                model_kwargs["x_future"] = x_future
+            if supports_x_static and (x_static is not None):
+                model_kwargs["x_static"] = x_static
+
+            logits = model(x_past, **model_kwargs)
 
             loss = criterion(logits, y)
             batch_size = y.size(0)
@@ -220,14 +260,20 @@ def run_inference_quantile(
     all_true: list[torch.Tensor] = []
     all_pred: list[torch.Tensor] = []
 
+    forward_params = inspect.signature(model.forward).parameters
+    supports_x_static = "x_static" in forward_params
+
     with torch.no_grad():
         for batch in data_loader:
-            x_past, x_future, y = _unpack_batch(batch, device)  # y: (B, H) float
+            x_past, x_future, x_static, y = _unpack_batch(batch, device)
 
+            model_kwargs = {}
             if x_future is not None:
-                y_hat = model(x_past, x_future)  # (B, H, Q)
-            else:
-                y_hat = model(x_past)
+                model_kwargs["x_future"] = x_future
+            if supports_x_static and (x_static is not None):
+                model_kwargs["x_static"] = x_static
+
+            y_hat = model(x_past, **model_kwargs)
 
             if y_hat.ndim != 3:
                 raise RuntimeError(f"Expected y_hat to have 3 dims (B,H,Q), got shape={tuple(y_hat.shape)}")

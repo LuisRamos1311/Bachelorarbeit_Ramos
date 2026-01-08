@@ -448,6 +448,73 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+# ============================
+# 2B. STATIC REGIME FEATURES (Experiment 9d)
+# ============================
+
+def add_static_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add leakage-safe "static regime" features at each timestamp t.
+
+    Important:
+    - These are computed per timestamp, but later you will take them ONCE per sample
+      (e.g., at the window end_idx) as x_static.
+    - This function MUST NOT use shift(-1) or any future-looking operation.
+    - Rolling windows are causal by default (center=False), so they are safe.
+
+    Features (as specified in the Experiment 9d guide):
+      - reg_vol_24         : rolling std of log returns over 24 periods
+      - reg_vol_168        : rolling std of log returns over 168 periods
+      - reg_trend_168      : close / rolling_mean_168(close) - 1
+      - reg_drawdown_168   : close / rolling_max_168(close) - 1
+      - reg_volume_z_168   : z-score of volume_usd over 168 periods
+      - reg_vol_ratio      : reg_vol_24 / (reg_vol_168 + eps)
+
+    NaNs:
+    - Rolling windows will create NaNs at the beginning (warmup).
+    - Do NOT drop them here. The guide’s recommended approach is to drop warmup once
+      later via df.dropna(subset=config.STATIC_COLS).
+    """
+    df = df.copy()
+
+    # Basic column requirements
+    required_cols = {"close", "volume_usd"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise KeyError(
+            f"add_static_regime_features() missing required columns: {sorted(missing)}. "
+            f"Available columns: {sorted(df.columns)}"
+        )
+
+    close = df["close"].astype(float)
+    volume_usd = df["volume_usd"].astype(float)
+
+    eps = 1e-9
+
+    # Log returns: uses t and t-1 only (no future leakage)
+    ret = np.log(close / close.shift(1))
+
+    # Rolling volatilities
+    df["reg_vol_24"] = ret.rolling(window=24, min_periods=24).std()
+    df["reg_vol_168"] = ret.rolling(window=168, min_periods=168).std()
+
+    # Trend vs rolling mean (168)
+    ma_168 = close.rolling(window=168, min_periods=168).mean()
+    df["reg_trend_168"] = close / ma_168 - 1.0
+
+    # Drawdown vs rolling max (168)
+    max_168 = close.rolling(window=168, min_periods=168).max()
+    df["reg_drawdown_168"] = close / max_168 - 1.0
+
+    # Volume regime z-score (168)
+    vol_mean_168 = volume_usd.rolling(window=168, min_periods=168).mean()
+    vol_std_168 = volume_usd.rolling(window=168, min_periods=168).std()
+    df["reg_volume_z_168"] = (volume_usd - vol_mean_168) / (vol_std_168 + eps)
+
+    # Vol ratio
+    df["reg_vol_ratio"] = df["reg_vol_24"] / (df["reg_vol_168"] + eps)
+
+    return df
 
 # ============================
 # 3. CALENDAR & HALVING FEATURES
@@ -927,6 +994,76 @@ def scale_features(
 
     return train_df, val_df, test_df, scalers
 
+def scale_static_features(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    static_cols: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, StandardScaler | None]:
+    """
+    Standardize static regime features using StandardScaler.
+
+    Leakage-safe rule:
+      - Fit scaler on TRAIN only
+      - Transform TRAIN / VAL / TEST with same scaler
+
+    Returns:
+      (train_df_scaled, val_df_scaled, test_df_scaled, static_scaler)
+      If static_cols is empty, returns dfs unchanged and static_scaler=None.
+    """
+    static_cols = list(static_cols) if static_cols is not None else []
+    if len(static_cols) == 0:
+        return train_df, val_df, test_df, None
+
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+
+    # Validate columns exist
+    missing = [c for c in static_cols if c not in train_df.columns]
+    if missing:
+        raise ValueError(
+            f"[scale_static_features] Missing static columns in df: {missing}. "
+            "Make sure add_static_regime_features() ran and you did df.dropna(subset=config.STATIC_COLS) "
+            "before splitting."
+        )
+
+    # Safety checks: NaN / Inf
+    def _assert_finite(df: pd.DataFrame, cols: List[str], split_name: str, stage: str) -> None:
+        if not cols:
+            return
+
+        nan_mask = df[cols].isna()
+        if nan_mask.any().any():
+            nan_cols = nan_mask.columns[nan_mask.any()].tolist()
+            raise ValueError(
+                f"[scale_static_features] NaNs in {split_name} {stage} for columns: {nan_cols}. "
+                "Likely missing warmup dropna(subset=STATIC_COLS) or static features not computed for early rows."
+            )
+
+        arr = df[cols].to_numpy(dtype=float)
+        if not np.isfinite(arr).all():
+            raise ValueError(
+                f"[scale_static_features] Inf/non-finite values in {split_name} {stage}. "
+                "Check static feature generation for division-by-zero (std=0) or extreme values."
+            )
+
+    _assert_finite(train_df, static_cols, "TRAIN", "(before scaling)")
+    _assert_finite(val_df, static_cols, "VAL", "(before scaling)")
+    _assert_finite(test_df, static_cols, "TEST", "(before scaling)")
+
+    static_scaler = StandardScaler()
+    static_scaler.fit(train_df[static_cols])  # <-- TRAIN ONLY
+
+    train_df.loc[:, static_cols] = static_scaler.transform(train_df[static_cols])
+    val_df.loc[:, static_cols] = static_scaler.transform(val_df[static_cols])
+    test_df.loc[:, static_cols] = static_scaler.transform(test_df[static_cols])
+
+    _assert_finite(train_df, static_cols, "TRAIN", "(after scaling)")
+    _assert_finite(val_df, static_cols, "VAL", "(after scaling)")
+    _assert_finite(test_df, static_cols, "TEST", "(after scaling)")
+
+    return train_df, val_df, test_df, static_scaler
 
 # ============================
 # 7. SEQUENCE CREATION
@@ -939,22 +1076,16 @@ def build_sequences(
     future_cols: List[str] | None = None,
     label_col: str | None = config.TARGET_COLUMN,
     target_cols: List[str] | None = None,   # <-- NEW for 9c
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    static_cols: List[str] | None = None,   # <-- NEW for 9d
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """
-    Build sliding-window sequences and labels from a DataFrame for classification and quantile forecasting.
+    Build sliding-window sequences and labels.
 
-    For each sample, we create:
-      - X_past: sequence of length `seq_length` over `feature_cols`
-      - y:      scalar integer label taken from `label_col` at the LAST timestep
-      - f:      (optional) vector of future covariates for the next timestep
-                future covariates aligned with the main horizon H (t+H) for each sample.
-
-    Indexing convention:
-      - The DataFrame is assumed to be sorted in chronological order.
-      - If seq_length = 30 and the current end index is t, then
-          X_past uses rows [t-29, ..., t]
-          y      is df[label_col] at index t
-          f      is df[future_cols] at index t
+    Returns (in order):
+      - sequences_arr: (N, seq_length, n_features)
+      - labels_arr:    (N,) for classification OR (N, H) for quantile forecast
+      - future_covariates_arr: (N, n_future_features) or None
+      - static_covariates_arr: (N, n_static_features) or None  <-- NEW
     """
     df = df.copy()
     df = df.sort_index()  # ensure chronological order
@@ -968,11 +1099,10 @@ def build_sequences(
         )
     feature_array = df[feature_cols].values.astype(np.float32)
 
-    # Targets: scalar classification label
+    # Targets
     task_type = getattr(config, "TASK_TYPE", "classification")
 
     if task_type == "quantile_forecast":
-        # Targets: multi-horizon regression vector (H,)
         if target_cols is None:
             raise ValueError(
                 "target_cols must be provided for quantile_forecast "
@@ -984,19 +1114,15 @@ def build_sequences(
                 f"Missing target columns in df: {missing_tgt}. "
                 "Make sure multi-horizon targets were created before build_sequences()."
             )
-        # (len(df), H)
-        target_array = df[target_cols].values.astype(np.float32)
-
+        target_array = df[target_cols].values.astype(np.float32)  # (len(df), H)
     else:
-        # Targets: scalar classification label
         if label_col is None:
             raise ValueError("label_col must be provided for classification.")
         if label_col not in df.columns:
             raise ValueError(
                 f"DataFrame must contain '{label_col}' column before building sequences."
             )
-        # (len(df),)
-        target_array = df[label_col].values.astype(np.int64)
+        target_array = df[label_col].values.astype(np.int64)  # (len(df),)
 
     # Future covariates
     if future_cols is not None:
@@ -1004,55 +1130,64 @@ def build_sequences(
             if col not in df.columns:
                 raise ValueError(
                     f"Future covariate column '{col}' is missing. "
-                    f"Make sure add_future_covariates() was called."
+                    "Make sure add_future_covariates() was called."
                 )
         future_array = df[future_cols].values.astype(np.float32)
     else:
         future_array = None
 
+    # Static covariates (regime features)
+    if static_cols is not None and len(static_cols) > 0:
+        for col in static_cols:
+            if col not in df.columns:
+                raise ValueError(
+                    f"Static covariate column '{col}' is missing. "
+                    "Make sure add_static_regime_features() was called and df.dropna(subset=STATIC_COLS) ran."
+                )
+        static_array = df[static_cols].values.astype(np.float32)
+    else:
+        static_array = None
+
     sequences: List[np.ndarray] = []
     labels: List[np.ndarray] = []
     future_covariates: List[np.ndarray] = []
+    static_covariates: List[np.ndarray] = []
 
-    # We start at index seq_length-1 because we need seq_length timesteps
     for end_idx in range(seq_length - 1, len(df)):
         start_idx = end_idx - seq_length + 1
 
-        # Past sequence for [start_idx, ... end_idx]
-        seq_x = feature_array[start_idx: end_idx + 1]   # (seq_length, n_features)
+        seq_x = feature_array[start_idx: end_idx + 1]  # (seq_length, n_features)
+
         if task_type == "quantile_forecast":
-            y = target_array[end_idx]  # (H,) float32
+            y = target_array[end_idx]  # (H,)
             if np.isnan(y).any():
                 raise ValueError(
                     f"NaNs found in multi-horizon target at end_idx={end_idx}. "
                     "Check tail-dropping (DROP_LAST_H_IN_EACH_SPLIT) and target creation."
                 )
         else:
-            y = target_array[end_idx]  # scalar int64
+            y = target_array[end_idx]  # scalar
 
         sequences.append(seq_x)
         labels.append(y)
 
-        # Future covariates
         if future_array is not None:
-            f = future_array[end_idx]                   # (n_future_features,)
-            future_covariates.append(f)
+            future_covariates.append(future_array[end_idx])
 
-    sequences_arr = np.stack(sequences)  # (N, seq_length, n_features)
+        if static_array is not None:
+            static_covariates.append(static_array[end_idx])
+
+    sequences_arr = np.stack(sequences)
+
     if task_type in ("quantile_forecast", "regression_quantile"):
-        labels_arr = np.stack(labels).astype(np.float32)  # (N, H)
+        labels_arr = np.stack(labels).astype(np.float32)
     else:
-        labels_arr = np.array(labels, dtype=np.int64)  # (N,)
+        labels_arr = np.array(labels, dtype=np.int64)
 
-    if future_array is not None:
-        future_covariates_arr: np.ndarray | None = np.stack(
-            future_covariates
-        )  # (N, n_future_features)
-    else:
-        future_covariates_arr = None
+    future_covariates_arr = np.stack(future_covariates) if future_array is not None else None
+    static_covariates_arr = np.stack(static_covariates) if static_array is not None else None
 
-    return sequences_arr, labels_arr, future_covariates_arr
-
+    return sequences_arr, labels_arr, future_covariates_arr, static_covariates_arr
 
 # ============================
 # 8. PYTORCH DATASET
@@ -1070,13 +1205,15 @@ class BTCTFTDataset(Dataset):
     """
 
     def __init__(
-        self,
-        sequences: np.ndarray,
-        labels: np.ndarray,
-        future_covariates: np.ndarray | None = None,
+            self,
+            sequences: np.ndarray,
+            labels: np.ndarray,
+            future_covariates: np.ndarray | None = None,
+            static_covariates: np.ndarray | None = None,
     ):
         assert len(sequences) == len(labels), "Sequences and labels must have same length."
 
+        # --- future covariates (known-ahead features) ---
         if future_covariates is not None:
             assert len(future_covariates) == len(labels), (
                 "Future covariates and labels must have same length."
@@ -1085,8 +1222,19 @@ class BTCTFTDataset(Dataset):
         else:
             self.future_covariates = None
 
+        # --- static covariates (regime/context features) ---
+        if static_covariates is not None:
+            assert len(static_covariates) == len(labels), (
+                "Static covariates and labels must have same length."
+            )
+            self.static_covariates = torch.from_numpy(static_covariates).float()
+        else:
+            self.static_covariates = None
+
+        # --- past sequence (observed inputs) ---
         self.sequences = torch.from_numpy(sequences).float()
-        # Long dtype for CrossEntropyLoss (class indices)
+
+        # --- labels dtype depends on task ---
         task_type = getattr(config, "TASK_TYPE", "classification")
 
         if task_type in ("quantile_forecast", "regression_quantile"):
@@ -1100,10 +1248,23 @@ class BTCTFTDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx: int):
-        if self.future_covariates is None:
-            return self.sequences[idx], self.labels[idx]
-        else:
-            return self.sequences[idx], self.future_covariates[idx], self.labels[idx]
+        x_past = self.sequences[idx]
+        y = self.labels[idx]
+
+        # 1) no future, no static
+        if self.future_covariates is None and self.static_covariates is None:
+            return x_past, y
+
+        # 2) future only (legacy behavior)
+        if self.future_covariates is not None and self.static_covariates is None:
+            return x_past, self.future_covariates[idx], y
+
+        # 3) static only
+        if self.future_covariates is None and self.static_covariates is not None:
+            return x_past, self.static_covariates[idx], y
+
+        # 4) both future + static (new behavior for 9d)
+        return x_past, self.future_covariates[idx], self.static_covariates[idx], y
 
 # Compute targets *inside a split*
 def label_split_safely(df_split: pd.DataFrame, split_name: str) -> pd.DataFrame:
@@ -1333,6 +1494,17 @@ def prepare_datasets(
     # 4. Add future covariate columns (shift to t+H, where H = FORECAST_HORIZONS[0])
     df = add_future_covariates(df)
 
+    # 4.5 Add static regime features (Experiment 9d) + drop warmup once
+    if getattr(config, "STATIC_COLS", None):
+        df = add_static_regime_features(df)
+
+        # Drop the initial warmup rows created by rolling windows (e.g., 168h)
+        before = len(df)
+        df = df.dropna(subset=config.STATIC_COLS)
+        after = len(df)
+        if getattr(config, "DEBUG_DATA_INTEGRITY", False):
+            print(f"[data_pipeline][DEBUG] Dropped {before - after} warmup rows due to STATIC_COLS.")
+
     # 5. Split FIRST (Experiment 9a Part A)
     train_df, val_df, test_df = split_by_date(df)
 
@@ -1402,6 +1574,13 @@ def prepare_datasets(
         train_df, val_df, test_df, feature_cols
     )
 
+    # 9b. Scale static regime features (train-fit only)
+    train_df_scaled, val_df_scaled, test_df_scaled, static_scaler = scale_static_features(
+        train_df_scaled, val_df_scaled, test_df_scaled, getattr(config, "STATIC_COLS", [])
+    )
+    scalers["static_scaler"] = static_scaler
+    scalers["static_cols"] = list(getattr(config, "STATIC_COLS", []))
+
     # 9c. Extract H-step forward returns aligned with samples (optional).
     def extract_forward_returns(df_scaled: pd.DataFrame, seq_len: int) -> np.ndarray:
         """
@@ -1449,41 +1628,61 @@ def prepare_datasets(
             prefix = getattr(config, "TARGET_RET_PREFIX", "y_ret_")
             target_cols = [f"{prefix}{h}" for h in range(1, H + 1)]
 
-        train_seq, train_labels, train_future = build_sequences(
+        train_seq, train_labels, train_future, train_static = build_sequences(
             train_df_scaled,
             feature_cols,
             seq_length,
             future_cols=future_cols,
             label_col=None,
             target_cols=target_cols,
+            static_cols=getattr(config, "STATIC_COLS", []),
         )
-        val_seq, val_labels, val_future = build_sequences(
+
+        val_seq, val_labels, val_future, val_static = build_sequences(
             val_df_scaled,
             feature_cols,
             seq_length,
             future_cols=future_cols,
             label_col=None,
             target_cols=target_cols,
+            static_cols=getattr(config, "STATIC_COLS", []),
         )
-        test_seq, test_labels, test_future = build_sequences(
+        test_seq, test_labels, test_future, test_static = build_sequences(
             test_df_scaled,
             feature_cols,
             seq_length,
             future_cols=future_cols,
             label_col=None,
             target_cols=target_cols,
+            static_cols=getattr(config, "STATIC_COLS", []),
         )
+
     else:
         label_col = config.TARGET_COLUMN
 
-        train_seq, train_labels, train_future = build_sequences(
-            train_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        train_seq, train_labels, train_future, train_static = build_sequences(
+            train_df_scaled,
+            feature_cols,
+            seq_length,
+            future_cols=future_cols,
+            label_col=label_col,
+            static_cols=getattr(config, "STATIC_COLS", []),
         )
-        val_seq, val_labels, val_future = build_sequences(
-            val_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        val_seq, val_labels, val_future, val_static = build_sequences(
+            val_df_scaled,
+            feature_cols,
+            seq_length,
+            future_cols=future_cols,
+            label_col=label_col,
+            static_cols=getattr(config, "STATIC_COLS", []),
         )
-        test_seq, test_labels, test_future = build_sequences(
-            test_df_scaled, feature_cols, seq_length, future_cols=future_cols, label_col=label_col
+        test_seq, test_labels, test_future, test_static = build_sequences(
+            test_df_scaled,
+            feature_cols,
+            seq_length,
+            future_cols=future_cols,
+            label_col=label_col,
+            static_cols=getattr(config, "STATIC_COLS", []),
         )
 
     if task_type in ("quantile_forecast", "regression_quantile"):
@@ -1508,9 +1707,24 @@ def prepare_datasets(
         )
 
     # 11. Wrap into Datasets
-    train_dataset = BTCTFTDataset(train_seq, train_labels, train_future)
-    val_dataset   = BTCTFTDataset(val_seq, val_labels, val_future)
-    test_dataset  = BTCTFTDataset(test_seq, test_labels, test_future)
+    train_dataset = BTCTFTDataset(
+        sequences=train_seq,
+        labels=train_labels,
+        future_covariates=train_future,
+        static_covariates=train_static,
+    )
+    val_dataset = BTCTFTDataset(
+        sequences=val_seq,
+        labels=val_labels,
+        future_covariates=val_future,
+        static_covariates=val_static,
+    )
+    test_dataset = BTCTFTDataset(
+        sequences=test_seq,
+        labels=test_labels,
+        future_covariates=test_future,
+        static_covariates=test_static,
+    )
 
     if return_forward_returns:
         forward_returns = {
@@ -1550,15 +1764,37 @@ if __name__ == "__main__":
     # Take the first sample from the training set
     sample = train_ds[0]
 
+    future = None
+    x_static = None
+
     if len(sample) == 2:
         x, y = sample
-        future = None
+
+    elif len(sample) == 3:
+        x, x2, y = sample
+
+        # Disambiguate 3-tuple case based on which covariates are enabled
+        if config.MODEL_CONFIG.use_future_covariates and not config.MODEL_CONFIG.use_static_covariates:
+            future = x2
+        elif config.MODEL_CONFIG.use_static_covariates and not config.MODEL_CONFIG.use_future_covariates:
+            x_static = x2
+        else:
+            raise ValueError(
+                "Got a 3-item sample while BOTH future and static covariates are enabled. "
+                "Expected (x_past, x_future, x_static, y)."
+            )
+
+    elif len(sample) == 4:
+        x, future, x_static, y = sample
+
     else:
-        x, future, y = sample
+        raise ValueError(f"Unexpected sample length: {len(sample)}")
 
     print(f"One sample X shape:       {x.shape}  (seq_length, n_features)")
     if future is not None:
         print(f"One sample future shape:  {future.shape}  (n_future_features,)")
+    if x_static is not None:
+        print(f"One sample static shape:  {x_static.shape}  (n_static_features,)")
 
     print(f"One sample y shape:       {tuple(y.shape)}")
     print(f"One sample y values:      {y.numpy()}")
