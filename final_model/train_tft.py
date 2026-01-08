@@ -29,7 +29,7 @@ from typing import Dict, Tuple, Optional
 import torch
 from torch.utils.data import DataLoader
 
-from experiment_9d.config import (
+from final_model.config import (
     MODEL_CONFIG,
     TRAINING_CONFIG,
     MODELS_DIR,
@@ -52,10 +52,10 @@ from experiment_9d.config import (
     FORECAST_HORIZON,
     QUANTILES,
 )
-from experiment_9d import config as cfg
-from experiment_9d.data_pipeline import prepare_datasets
-from experiment_9d.tft_model import TemporalFusionTransformer
-from experiment_9d import utils
+from final_model import config as cfg
+from final_model.data_pipeline import prepare_datasets
+from final_model.tft_model import TemporalFusionTransformer
+from final_model import utils
 
 
 # ============================================================

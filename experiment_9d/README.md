@@ -1,161 +1,204 @@
-# Experiment 9c (BTC): Multi-Horizon Quantile Forecasting + Percentile Threshold Trading  
-**Baseline experiment for future upgrades** — with a direct comparison against **Experiment 9b**.
+# Experiment 9d (BTC): Static Regime-Conditioned TFT  
+**Upgrade over Experiment 9c:** add **static regime features** and inject them as **context** into TFT gating/variable selection to improve cross-regime robustness.
 
-This folder implements the evolution from **Experiment 9b → Experiment 9c**:
-
-- **Experiment 9b**: 3-class direction classification (`DOWN / FLAT / UP`) and a trading rule based on `P(UP)` thresholding.
-- **Experiment 9c**: **multi-horizon quantile regression** (uncertainty-aware forecasting) and a trading rule based on a **risk-adjusted score** derived from quantiles.
-- **Update (finalized)**: thesis-friendly reporting with **5 plots + 2 tables** per evaluation run (instead of “probability-style histograms” that did not fit 9c well).
-
-Goal: a **reproducible, interpretable baseline** that can be evaluated fairly across regimes (bear vs bull) and compared to 9b.
+This experiment keeps the **9c core setup** (24h-ahead quantile forecasting + uncertainty-aware threshold trading) and introduces **static covariates** (a per-sample regime vector) to condition the TFT.
 
 ---
 
-## 1) What changed from 9b to 9c?
+## 1) Goal
 
-### Experiment 9b (classification baseline)
-**Task**: classify the 24h-ahead move into:
-- `DOWN / FLAT / UP`, using `DIRECTION_THRESHOLD = 0.005` (±0.5%) on 24h returns (log returns if enabled)
-
-**Trading signal (9b)**:
-1. Compute `P(UP)` on validation.
-2. Sweep thresholds `τ` (probability thresholds).
-3. Select `τ*` that maximizes **validation Sharpe**.
-4. Apply `τ*` on test using a **long-only**, non-overlapping strategy (hold = 24h).
-
-This is easy to interpret (confusion matrices, ROC), but the trading signal depends heavily on how well `P(UP)` separates regimes.
+1. Keep the **probabilistic forecasting** framing from 9c:
+   - predict **24h-ahead returns** via quantiles (q10/q50/q90)
+2. Improve **decision usefulness** (trading signal quality) by conditioning the model on a compact, leak-free **regime snapshot**:
+   - volatility / trend / drawdown type descriptors computed from *past* data only
+3. Evaluate across two very different regimes:
+   - **2022 (bear)**
+   - **2024 (bull)**
 
 ---
 
-### Experiment 9c (quantile forecasting baseline)
-**Task**: multi-horizon quantile forecasting with:
-- horizons `H = 24` (1h steps → up to 24h)
-- quantiles `Q = [0.1, 0.5, 0.9]`
-- loss = **pinball loss** (quantile loss)
+## 2) Data, Features & Targets
 
-Instead of a single point estimate, the model predicts a distribution:
-- `q10`, `q50` (median), `q90` for each horizon.
+### Data (hourly BTC)
+- Frequency: **1h**
+- Lookback window: **96 hours** (4 days)
+- Forecast horizon: **24 hours ahead** (signal horizon = 24)
 
----
+> The code supports multi-horizon lists, but these runs focus on the 24h horizon (H=24).
 
-## 2) Trading rule in 9c (uncertainty-aware score)
+### Features
 
-For the selected trading horizon (24h-ahead), define:
+We use three feature “channels”:
 
-- `μ = q50`  
-- `IQR = q90 − q10`  
-- `score = μ / (IQR + ε)`
+#### A) Past covariates (time-varying, length=96)
+- OHLCV-derived market features (price + volume)
+- Technical indicators (e.g. RSI/MACD/ATR/ROC style)
+- Optional external features (e.g. on-chain, sentiment) depending on your config
 
-This acts like a **risk-adjusted forecast**:
-- big positive median + tight uncertainty band → high score
-- wide uncertainty → score shrinks
+These are scaled with train-only statistics (MinMax for price/volume-style columns, StandardScaler for indicator-style columns).
 
-**Long-only decision rule**
-- enter long if `(score ≥ τ) AND (μ > 0)`
-- otherwise stay out
+#### B) Known-future covariates (time-varying, length=24)
+- Calendar / seasonality signals (hour/day/week/month, weekend flags)
+- Optional event flags (e.g. halving-window indicators)
 
-We evaluate using **non-overlapping trades** (step size = 24 hours).
+These are “known at decision time” and are safe to feed at t+1…t+24.
 
----
+#### C) NEW in 9d: Static regime covariates (one vector per sample)
+A per-sample vector summarizing the regime at the **end of the encoder window** (time t), built from *past-only rolling statistics*. Typical examples:
 
-## 3) Why percentile thresholding matters (and what it does / does not do)
+- rolling volatility (short/medium window)
+- rolling trend vs moving average
+- rolling drawdown (peak-to-trough)
+- rolling volume z-score / volume regime ratios
 
-Raw score values shift across years (different volatility/regimes), so fixed numeric grids are unstable.
+**Leakage guardrail:** these are computed using only information available up to time t (no negative shifts, no use of future close).
 
-Example (from recent runs):
-- 2022 scores were around ~0.07
-- 2024 scores were around ~0.026–0.034
+Static features are scaled with a StandardScaler fit on the training split only.
 
-### Percentile grid (recommended baseline)
-Instead of hard-coded score values, we define a list of validation-score percentiles:
+### Target (24h-ahead return)
+- Predict 24h log return:
 
-`PERCENTILES = [0.10, 0.20, ..., 0.90, 0.95]`
+  \[
+  y(t) = \log\left(\frac{close(t+24)}{close(t)}\right)
+  \]
 
-Evaluation converts them into thresholds:
-- `τ_p = percentile(score_val, p)`
-- sweep over `{τ_p}` and choose `τ*` by **validation Sharpe**
-
-**Important note:** percentile thresholds ensure comparability of the *grid* across regimes,  
-but they **do not force selectivity**. If the best percentile is low (e.g., 0.10), the strategy can still become “mostly long”.
+- Train as **quantile regression** with Q = [0.1, 0.5, 0.9] using **pinball loss**.
 
 ---
 
-## 4) Updated reporting pack (final)
+## 3) Model (TFT) & What Changed in 9d
 
-Experiment 9c now produces thesis-friendly diagnostics:
+### 3.1 Core TFT (same idea as 9c)
+- Input projections for past/future features
+- Variable Selection Network (VSN) to learn feature importances
+- LSTM encoder for temporal dynamics
+- Self-attention over encoder outputs
+- Gated Residual Networks (GRNs) + gating for stable training
+- Quantile output head → (q10, q50, q90)
 
-### Figures (max 5)
-1. **Training curves** (loss + MAE over epochs)
-2. **Test forecast band** (actual vs `q50` with `[q10, q90]` uncertainty band at signal horizon)
-3. **Threshold sweep** (validation Sharpe vs threshold; shows threshold choice)
-4. **Test equity curves (net)** (strategy vs buy&hold)
-5. **Test signal confusion matrix** (2×2: predicted position vs realized outcome)
+### 3.2 NEW in 9d: Static encoder + context injection
+9d adds:
 
-### Tables (2)
-- `*_forecast_table.csv` (forecast metrics summary)
-- `*_trading_table.csv` (trading metrics summary)
+1. **Static encoder**
+   - Encodes x_static (B, S) → static_context (B, hidden)
 
-JSON artifacts remain for reproducibility:
-- `*_metrics.json`
-- `*_score_threshold_sweep.json`
+2. **Context-conditioned GRNs + VSN weights**
+   - Inject static_context *inside* GRNs via a learned context projection before the nonlinearity
+   - Condition VSN weight networks on static_context (regime-dependent feature selection)
 
----
-
-## 5) Results: 9c across regimes (bear 2022 vs bull 2024)
-
-Assumptions:
-- long-only, non-overlapping trades (24h step)
-- net-of-cost: **cost=5bps**, **slippage=2bps**
-- annualization: 365
-
-### 9c headline results (net-of-cost, test)
-| Test year | τ* | Long rate (test) | Strategy net Sharpe | Strategy net CumRet | Strategy net MDD | Buy&Hold net Sharpe | Buy&Hold net CumRet | Random baseline p95 CumRet |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2022 (bear) | 0.0711 | 0.338 | 0.1578 | -0.0162 | 0.3114 | -1.2803 | -0.6398 | 0.0607 |
-| 2024 (bull) | 0.0264 | 0.873 | 1.7291 | 1.0932 | 0.2120 | 1.6817 | 1.1104 | 1.4002 |
-
-### 9c forecast quality (signal=24h, test)
-| Test year | Test pinball | Test MAE@24 |
-|---|---:|---:|
-| 2022 | 0.006122 | 0.025485 |
-| 2024 | 0.004462 | 0.019419 |
-
-**Interpretation**
-- **2022 (bear)**: 9c behaves like a *risk filter* — it avoids much of the drawdown vs buy&hold, and ends near flat net-of-cost.
-- **2024 (bull)**: 9c performs similarly to buy&hold because the optimal validation threshold is at a low percentile (high exposure). Profitability is high, but it does not prove strong “selective alpha” on its own.
+Intuition:
+- In high-volatility / bear regimes, the model can learn to:
+  - widen uncertainty, lower confidence scores, reduce exposure
+- In stable / trending regimes, it can:
+  - tighten uncertainty and increase confidence when signals are cleaner
 
 ---
 
-## 6) Comparison: 9b vs 9c (what to take away)
+## 4) Trading Rule & Evaluation (same framework as 9c)
 
-Below are the *previously recorded* 9b summary numbers (kept for continuity).  
-Note that 9b and 9c use different learning targets (classification vs quantiles), so you should compare:
-- 9b: classification quality (MC F1) + trading metrics
-- 9c: pinball/MAE (forecast quality) + trading metrics
+### 4.1 Uncertainty-aware score
+At signal horizon H=24:
 
-### Key comparison table (net-of-cost, test)
-| Experiment | Test year | Val year | τ* | Net Sharpe (test) | Net CumRet (test) | Buy&Hold Net Sharpe (test) | Buy&Hold Net CumRet (test) | Test MC F1 | Test pinball | Test MAE@24 |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 9b (classification) | 2022 (bear) | 2021 | 0.3500 | -1.4911 | -0.6361 | -1.5899 | -0.7093 | 0.3032 | — | — |
-| 9b (classification) | 2024 (bull) | 2023 | 0.4500 | 1.2140 | 0.3845 | 1.4293 | 0.8405 | 0.3058 | — | — |
-| 9c (quantile + percentile τ) | 2022 (bear) | 2021 | 0.0711 | 0.1578 | -0.0162 | -1.2803 | -0.6398 | — | 0.0061 | 0.0255 |
-| 9c (quantile + percentile τ) | 2024 (bull) | 2023 | 0.0264 | 1.7291 | 1.0932 | 1.6817 | 1.1104 | — | 0.0045 | 0.0194 |
+- μ = q50  
+- IQR = q90 − q10  
+- score = μ / (IQR + ε)
 
-### Practical recommendation
-If you must pick one baseline for future development:
-- **Use 9c** if you care about probabilistic forecasting + uncertainty-aware risk control (closest to TFT’s original multi-horizon quantile idea).
-- Keep **9b** as a secondary baseline for direction interpretability (classic confusion matrix / ROC storytelling).
+### 4.2 Long-only decision rule
+- Go long if: **(score ≥ τ) AND (μ > 0)**
+- Otherwise: stay in cash
+
+We evaluate with:
+- **non-overlapping 24h trades** (step size = 24h)
+- **net-of-cost** results (transaction cost + slippage applied on position changes)
+
+### 4.3 Reporting pack
+Each evaluation produces:
+- Training curves (loss + MAE)
+- Forecast band plot (actual vs q50 with [q10,q90])
+- Threshold sweep plot (validation selection score vs τ)
+- Net equity curves (strategy vs buy&hold)
+- Confusion matrix (long vs no-long vs realized outcome)
+- Two tables:
+  - forecast metrics CSV
+  - trading metrics CSV
+- JSON artifacts for reproducibility (metrics + sweep)
 
 ---
 
-## 7) Conclusion: How good is Experiment 9c as a predicting tool?
+## 5) Results: 9c vs 9d (2022 bear, 2024 bull)
 
-**As a forecasting model (predicting 24h returns):**
-Experiment 9c produces stable point-forecast metrics (pinball loss / MAE) and provides uncertainty estimates via quantiles (q10/q50/q90). This makes it a valid *probabilistic forecasting* tool in the spirit of TFT-style quantile prediction. However, across regimes the uncertainty calibration is not stable: in the 2022 bear regime the prediction intervals are overly conservative (very high q10–q90 coverage), while in the 2024 bull regime the intervals become too narrow (coverage below nominal). This indicates that the model’s uncertainty estimates are not yet reliable as “true probabilities” across different market conditions.
+### 5.1 Trading results (test, net-of-cost)
+| Test year | Exp | τ* | Long rate | # trades | Sharpe (net) | CumRet (net) | MaxDD (net) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2022 (bear) | 9c | 0.0711 | 0.338 | 122 | 0.158 | -0.016 | 0.311 |
+| 2022 (bear) | 9d | 0.0402 | 0.036 | 13 | -0.237 | -0.053 | 0.201 |
+| 2024 (bull) | 9c | 0.0264 | 0.873 | 316 | 1.729 | 1.093 | 0.212 |
+| 2024 (bull) | 9d | 0.0225 | 0.503 | 182 | 2.240 | 1.126 | 0.211 |
 
-**As a trading-oriented predictor (decision usefulness):**
-The model is most useful as a *risk filter* rather than a strong alpha generator. In 2022 it meaningfully reduces drawdowns compared to buy & hold (capital preservation behavior). In 2024 it performs similarly to buy & hold because the validation-selected threshold leads to high market exposure; in other words, strong results in a bull market can be explained largely by being long most of the time rather than by selective predictive skill. The random baseline with matched exposure remains an important stress test: if the strategy does not consistently beat that baseline, profitability is not strong evidence of genuine predictive edge.
+**Buy & hold reference (net, same test years):**
+- 2022: CumRet **-0.640**, Sharpe **-1.280**, MaxDD **0.668**
+- 2024: CumRet **1.110**, Sharpe **1.682**, MaxDD **0.262**
 
-**Overall assessment:**
-Experiment 9c is a solid baseline for thesis work because it is (1) probabilistic and multi-horizon (quantile) rather than purely directional, (2) evaluated with realistic net-of-cost backtests, and (3) tested across different regimes. At the current stage, its strongest demonstrated benefit is regime-dependent risk control. The main limitation is that predictive selectivity and calibration stability across years are not yet strong enough to claim consistent trading alpha.
+### 5.2 Forecast quality (test)
+| Test year | Exp | Pinball (test) | MAE@24 (test) | Coverage q10–q90 |
+|---|---:|---:|---:|---:|
+| 2022 (bear) | 9c | 0.006122 | 0.025485 | 0.935 |
+| 2022 (bear) | 9d | 0.005480 | 0.023224 | 0.859 |
+| 2024 (bull) | 9c | 0.004462 | 0.019419 | 0.745 |
+| 2024 (bull) | 9d | 0.004436 | 0.019440 | 0.769 |
 
+### 5.3 Interpretation
+
+#### 2024 (bull)
+- 9d achieves a **large Sharpe improvement** over 9c while keeping drawdown similar.
+- The main mechanism is **selectivity**:
+  - long rate drops from ~0.87 (9c) to ~0.50 (9d),
+  - trades drop from 316 → 182,
+  - average net trade return increases materially.
+- This matches the equity curve behavior: the strategy avoids some chop/drawdown and stays out during lower-confidence periods, while still capturing enough upside.
+
+#### 2022 (bear)
+- 9d improves *forecast* metrics (pinball + MAE) and moves interval coverage closer to nominal,
+  but the trading layer becomes **overly conservative**:
+  - long rate ~0.036 (only 13 trades),
+  - strategy ends slightly negative net-of-cost.
+- 9c traded more (~0.34 long rate) and stayed closer to flat net-of-cost in 2022.
+
+**What this means:**  
+The 9d model update is working (it changes regime selectivity), but the **threshold selection / score calibration** is now the main bottleneck for bear-regime performance.
+
+---
+
+## 6) Conclusion
+
+### What improved from 9c → 9d
+- **Bull-market selectivity and risk-adjusted performance improved strongly** (2024):
+  - higher Sharpe, lower volatility, similar drawdown, comparable or slightly higher net return.
+- Forecast uncertainty behavior becomes more regime-sensitive, and coverage moves closer to nominal.
+
+### What remains unsolved
+- In **bear regimes (2022)** the strategy becomes too “cash-heavy” and the few trades taken have negative expectancy.
+- This is likely not a pure forecasting problem (forecast metrics improved), but a **signal calibration / thresholding** problem.
+
+### Recommended next step (for 9e)
+- Make τ selection more robust:
+  - rolling / walk-forward validation (not a single slice),
+  - percentile thresholds or regime-aware τ,
+  - optionally add a “no-trade zone” around μ≈0 or a trend filter.
+
+---
+
+## 7) Reproducing the experiment
+
+1. Configure splits and feature toggles in `config.py`
+   - choose a test year (e.g. 2024) and matching validation window
+2. Train:
+   - `python train_tft.py`
+3. Evaluate:
+   - `python evaluate_tft.py`
+4. Collect artifacts:
+   - `*_metrics.json`, `*_score_threshold_sweep.json`
+   - `*_forecast_table.csv`, `*_trading_table.csv`
+   - plots: equity/forecast band/sweep/confusion/training curves
+
+Tip: to run the regime stress test, re-point the test period to 2022 and re-run evaluation with the same trained weights.

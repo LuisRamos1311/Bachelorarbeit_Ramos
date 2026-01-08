@@ -1,6 +1,5 @@
 """
-Turns raw BTC price data (daily or hourly) into PyTorch Datasets for the TFT
-model used in the experiment_9d setup.
+Turns raw BTC price data (daily or hourly) into PyTorch Datasets for the TFT model.
 
 Main steps:
 1. Load BTC price data from CSV (daily or hourly, depending on config).
@@ -23,7 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 import talib  # Technical Analysis library (C + Python wrapper)
-from experiment_9d import config
+from final_model import config
 from torch.utils.data import Dataset
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 

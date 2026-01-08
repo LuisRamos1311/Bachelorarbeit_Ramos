@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from experiment_9d import config
+from final_model import config
 
 
 # ============================
