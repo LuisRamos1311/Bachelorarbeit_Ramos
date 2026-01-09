@@ -22,7 +22,7 @@ from typing import List
 # 1. DATA PATHS
 # ============================
 
-# Folder that contains this experiment (…/project_root/experiment_9d)
+# Folder that contains this experiment (…/project_root/experiment_9c)
 EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Top-level project folder one level above (…/project_root)
@@ -61,28 +61,30 @@ BTC_SENTIMENT_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_sentiment_daily.csv")
 # ============================
 
 # Adjust these if your BTCUSD_hourly.csv covers a different period.
-TRAIN_START_DATE = "2016-01-01"   # first available hourly bar
-TRAIN_END_DATE   = "2020-12-31"   # covers 2018 bear, 2019 recovery, 2020–21 bull, 2022 bear
+TRAIN_START_DATE = "2016-01-01"
+TRAIN_END_DATE   = "2020-12-31"
 
-VAL_START_DATE   = "2021-01-01"   # recent but separate for tuning / threshold selection
-VAL_END_DATE     = "2021-12-31"
+VAL_START_DATE   = "2021-01-01"
+VAL_END_DATE     = "2021-10-31"
 
-TEST_START_DATE  = "2022-01-01"   # most recent, fully out-of-sample regime
-TEST_END_DATE    = "2022-12-31"   # or last available 2024 timestamp
+TEST_START_DATE  = "2021-11-01"
+TEST_END_DATE    = "2024-12-31"
 
 
 # ============================
 # 3. FEATURES, LABELS & TASK
 # ============================
 
-# Used only when TASK_TYPE == "classification":
-# direction_3c is the 3-class label derived from the H-step forward return:
-#   0 = DOWN, 1 = FLAT, 2 = UP
-# where H = FORECAST_HORIZONS[0] (in hourly steps for FREQUENCY="1h").
+# We keep the same label name for now ("direction_3c") so the rest of the pipeline
+# continues to work. In data_pipeline.add_target_column(), we will redefine it to mean:
+#   0 = DOWN  (H-step return < -DIRECTION_THRESHOLD)
+#   1 = FLAT  (|H-step return| <= DIRECTION_THRESHOLD)
+#   2 = UP    (H-step return >  DIRECTION_THRESHOLD)
+# where H = FORECAST_HORIZONS[0] is now measured in *hourly steps* (e.g. 24).
 TRIPLE_DIRECTION_COLUMN: str = "direction_3c"
 
 # For classification tasks, TARGET_COLUMN is the class label column.
-# For quantile forecasting, targets are multi-horizon return columns (TARGET_RET_COLS).
+# For quantile forecasting (9c), targets are multi-horizon return columns (TARGET_RET_COLS).
 TARGET_COLUMN: str = TRIPLE_DIRECTION_COLUMN
 DIRECTION_LABEL_COLUMN: str = TRIPLE_DIRECTION_COLUMN
 
@@ -127,7 +129,7 @@ if len(FORECAST_HORIZONS) < 1:
     raise ValueError("FORECAST_HORIZONS must contain at least one horizon step.")
 FORECAST_HORIZON: int = FORECAST_HORIZONS[0]
 
-# Multi-horizon regression targets (quantile_forecast)
+# Multi-horizon regression targets (Experiment 9c)
 TARGET_RET_PREFIX: str = "y_ret_"
 TARGET_RET_COLS: List[str] = [f"{TARGET_RET_PREFIX}{h}" for h in range(1, FORECAST_HORIZON + 1)]
 
@@ -210,18 +212,6 @@ FEATURE_COLS: List[str] = (
     + (SENTIMENT_COLS if USE_SENTIMENT else [])
 )
 
-# -------- Static covariates (Experiment 9d) --------
-# These are "per-window" (per sample) features, not time-varying sequences.
-# They will be encoded once and used as context.
-STATIC_COLS: List[str] = [
-    "reg_vol_24",
-    "reg_vol_168",
-    "reg_trend_168",
-    "reg_drawdown_168",
-    "reg_volume_z_168",
-    "reg_vol_ratio",
-]
-
 # -------- Calendar & halving features (base + future) --------
 # Base calendar features – attached to each timestamp t.
 # For hourly data, hour_of_day captures intraday patterns (0–23).
@@ -286,11 +276,6 @@ class ModelConfig:
     use_gating: bool = True
     use_variable_selection: bool = True
     use_future_covariates: bool = True
-
-    # --- Static covariates (Experiment 9d) ---
-    use_static_covariates: bool = True
-    static_input_size: int = len(STATIC_COLS)
-    static_context_size: int = hidden_size
 
     # Hidden size used inside VSNs/GRNs (tft_model.py reads this)
     variable_selection_hidden_size: int = 32

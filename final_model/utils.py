@@ -1034,7 +1034,7 @@ def plot_probability_histogram(
     plt.close(fig)
 
 # ============================================================
-# 8. REPORTING PACK HELPERS
+# 8. REPORTING PACK HELPERS (Experiment 9c)
 # ============================================================
 
 def save_table_csv(rows: Sequence[Dict[str, Any]], out_path: str) -> None:
@@ -1218,8 +1218,8 @@ def plot_threshold_sweep(
     Plot threshold sweep results.
 
     This supports BOTH sweep record formats used in your project:
-      - classification: records contain "val_binary"/"test_binary"
-      - quantile score sweep: records contain "selection_score" + optional "val_long_rate"
+      - classification (9b): records contain "val_binary"/"test_binary"
+      - quantile score sweep (9c): records contain "selection_score" + optional "val_long_rate"
 
     The y-axis is the sweep 'selection_score' (computed in evaluate_tft.py).
     If 'val_long_rate' is present, it is plotted on a secondary axis.
@@ -1248,7 +1248,7 @@ def plot_threshold_sweep(
     ax1.set_ylabel("Selection score")
     ax1.set_title(title)
 
-    # Optional overlay: validation long-rate if present
+    # Optional overlay: validation long-rate if present (9c)
     if np.isfinite(val_long_rate).any():
         ax2 = ax1.twinx()
         ax2.plot(thr, val_long_rate, marker="x", linestyle="--", label="Val long-rate")

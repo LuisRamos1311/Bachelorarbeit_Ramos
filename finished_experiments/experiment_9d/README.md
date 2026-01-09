@@ -180,12 +180,6 @@ The 9d model update is working (it changes regime selectivity), but the **thresh
 - In **bear regimes (2022)** the strategy becomes too “cash-heavy” and the few trades taken have negative expectancy.
 - This is likely not a pure forecasting problem (forecast metrics improved), but a **signal calibration / thresholding** problem.
 
-### Recommended next step (for 9e)
-- Make τ selection more robust:
-  - rolling / walk-forward validation (not a single slice),
-  - percentile thresholds or regime-aware τ,
-  - optionally add a “no-trade zone” around μ≈0 or a trend filter.
-
 ---
 
 ## 7) Reproducing the experiment

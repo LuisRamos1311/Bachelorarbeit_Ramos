@@ -6,7 +6,7 @@ Evaluate a trained Temporal Fusion Transformer (TFT) model on the BTC dataset.
 Experiment / generic single-horizon setup:
 evaluation supports:
 classification (old path)
-quantile multi-horizon forecasting: pinball loss, MAE@trade horizon, and score-based threshold sweep.
+quantile multi-horizon forecasting (new 9c path): pinball loss, MAE@trade horizon, and score-based threshold sweep.
 
     - UP-vs-REST analysis with:
         * Manual threshold sweep over a fixed grid for P(UP)
@@ -28,7 +28,6 @@ Behaviour:
 """
 
 import os
-import inspect
 from typing import Tuple, Dict, Any, List
 import numpy as np
 import torch
@@ -55,12 +54,12 @@ from final_model.config import (
     USE_MULTI_HORIZON,
     FREQUENCY,
 
-    # Quantile forecasting
+    # Quantile forecasting (9c)
     FORECAST_HORIZON,
     QUANTILES,
     N_QUANTILES,
 
-    # Thresholding / trading knobs
+    # Thresholding / trading knobs (9b/9c)
     EVAL_THRESHOLD,
     AUTO_TUNE_THRESHOLD,
     THRESHOLD_SELECTION_METRIC,
@@ -122,57 +121,24 @@ def create_eval_dataloaders(
 
 def _unpack_batch(batch, device: torch.device):
     """
-    Handle dataset variants (Experiment 9d adds optional static covariates):
-
+    Handle both dataset variants:
       - (x_past, y)
-      - (x_past, x_future, y)            if only future covariates are enabled
-      - (x_past, x_static, y)            if only static covariates are enabled
-      - (x_past, x_future, x_static, y)  if both are enabled (Experiment 9d default)
-
-    Returns:
-        x_past, x_future, x_static, y   (with x_future/x_static possibly None)
+      - (x_past, x_future, y)
     """
-    x_future = None
-    x_static = None
-
     if len(batch) == 2:
         x_past, y = batch
-
-    elif len(batch) == 3:
-        x_past, x2, y = batch
-
-        # Disambiguate based on config switches (same as train_tft.py)
-        if MODEL_CONFIG.use_future_covariates and not MODEL_CONFIG.use_static_covariates:
-            x_future = x2
-        elif MODEL_CONFIG.use_static_covariates and not MODEL_CONFIG.use_future_covariates:
-            x_static = x2
-        else:
-            raise ValueError(
-                "Got a 3-item batch while BOTH future and static covariates are enabled. "
-                "Expected (x_past, x_future, x_static, y). "
-                "Check BTCTFTDataset.__getitem__() and config flags."
-            )
-
-    elif len(batch) == 4:
-        x_past, x_future, x_static, y = batch
-
+        x_future = None
     else:
-        raise ValueError(
-            f"Expected batch of length 2, 3, or 4, got {len(batch)}. "
-            "Check BTCTFTDataset.__getitem__()."
-        )
+        x_past, x_future, y = batch
 
-    # Move to device
     x_past = x_past.to(device)
     y = y.to(device)
 
     if x_future is not None:
         x_future = x_future.to(device)
 
-    if x_static is not None:
-        x_static = x_static.to(device)
+    return x_past, x_future, y
 
-    return x_past, x_future, x_static, y
 
 def run_inference_classification(
     model: nn.Module,
@@ -191,20 +157,14 @@ def run_inference_classification(
     all_true: List[torch.Tensor] = []
     all_prob: List[torch.Tensor] = []
 
-    forward_params = inspect.signature(model.forward).parameters
-    supports_x_static = "x_static" in forward_params
-
     with torch.no_grad():
         for batch in data_loader:
-            x_past, x_future, x_static, y = _unpack_batch(batch, device)
+            x_past, x_future, y = _unpack_batch(batch, device)
 
-            model_kwargs = {}
             if x_future is not None:
-                model_kwargs["x_future"] = x_future
-            if supports_x_static and (x_static is not None):
-                model_kwargs["x_static"] = x_static
-
-            logits = model(x_past, **model_kwargs)
+                logits = model(x_past, x_future)
+            else:
+                logits = model(x_past)
 
             loss = criterion(logits, y)
             batch_size = y.size(0)
@@ -260,20 +220,14 @@ def run_inference_quantile(
     all_true: list[torch.Tensor] = []
     all_pred: list[torch.Tensor] = []
 
-    forward_params = inspect.signature(model.forward).parameters
-    supports_x_static = "x_static" in forward_params
-
     with torch.no_grad():
         for batch in data_loader:
-            x_past, x_future, x_static, y = _unpack_batch(batch, device)
+            x_past, x_future, y = _unpack_batch(batch, device)  # y: (B, H) float
 
-            model_kwargs = {}
             if x_future is not None:
-                model_kwargs["x_future"] = x_future
-            if supports_x_static and (x_static is not None):
-                model_kwargs["x_static"] = x_static
-
-            y_hat = model(x_past, **model_kwargs)
+                y_hat = model(x_past, x_future)  # (B, H, Q)
+            else:
+                y_hat = model(x_past)
 
             if y_hat.ndim != 3:
                 raise RuntimeError(f"Expected y_hat to have 3 dims (B,H,Q), got shape={tuple(y_hat.shape)}")
@@ -307,7 +261,7 @@ def _build_score_mu_iqr(
     eps: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
     """
-    Score for trading:
+    Score for trading (9c):
         mu  = q50 at signal horizon
         iqr = q90 - q10 at signal horizon
         score = mu / (iqr + eps)
@@ -911,14 +865,14 @@ def main() -> None:
         utils.save_json(sweep_records, sweep_path)
         print(f"[evaluate_tft] Threshold sweep saved to {sweep_path}")
 
-    elif TASK_TYPE == "quantile_forecast":
+    elif TASK_TYPE in ("quantile_forecast", "regression_quantile"):
         print(
             f"[evaluate_tft] TASK_TYPE='{TASK_TYPE}' -> multi-horizon quantile forecast "
             f"(H={FORECAST_HORIZON}, QUANTILES={QUANTILES}, output_size={FORECAST_HORIZON * N_QUANTILES})."
         )
 
         H = int(getattr(cfg, "FORECAST_HORIZON", FORECAST_HORIZON))
-        quantiles = list(getattr(cfg, "QUNTILES", QUANTILES))
+        quantiles = list(getattr(cfg, "QUANTILES", QUANTILES))
         signal_h = int(getattr(cfg, "SIGNAL_HORIZON", SIGNAL_HORIZON))
         if signal_h < 1 or signal_h > H:
             raise ValueError(f"SIGNAL_HORIZON={signal_h} must be in [1, {H}]")
@@ -1038,7 +992,7 @@ def main() -> None:
         for thr in threshold_grid:
             thr = float(thr)
 
-            # LONG rule: score >= thr AND mu > 0
+            # LONG rule (9c): score >= thr AND mu > 0
             pos_val = ((score_val_tr >= thr) & (mu_val_tr > 0)).astype(int)
             pos_test = ((score_test_tr >= thr) & (mu_test_tr > 0)).astype(int)
 
@@ -1204,7 +1158,7 @@ def main() -> None:
         )
 
         # ------------------------------------------------------------------
-        # Reporting pack: quantile forecast plots + threshold sweep + equity curve
+        # 9c Reporting pack: replace score histograms
         # ------------------------------------------------------------------
 
         # Step 2.1 — Create 4 plot file paths (we generate the first two in Steps 2.2–2.3)
@@ -1379,7 +1333,7 @@ def main() -> None:
     metrics_path = os.path.join(EXPERIMENTS_DIR, f"{eval_id}_metrics.json")
     utils.save_json(metrics_out, metrics_path)
     if TASK_TYPE == "quantile_forecast":
-        print("[evaluate_tft] summary (quantile_forecast)")
+        print("[evaluate_tft] 9c summary (quantile_forecast)")
 
         cov_txt = f", coverage_q10_q90={coverage_q10_q90_test:.3f}" if coverage_q10_q90_test is not None else ""
         print(

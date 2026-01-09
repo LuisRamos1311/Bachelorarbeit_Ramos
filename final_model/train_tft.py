@@ -3,28 +3,23 @@ train_tft.py
 
 Training script for the Temporal Fusion Transformer (TFT) on BTC data.
 
-This script supports two tasks controlled by config.TASK_TYPE:
-  - "classification":
-      3-class direction label (DOWN/FLAT/UP) at horizon H = config.FORECAST_HORIZONS[0]
-      using config.DIRECTION_THRESHOLD.
-  - "quantile_forecast":
-      multi-horizon probabilistic forecast of forward returns for horizons 1..H
-      with quantiles config.QUANTILES (targets are config.TARGET_RET_COLS).
-
-Inputs:
-  - past covariate sequences from config.FEATURE_COLS over config.SEQ_LENGTH steps
-  - optional known-ahead future covariates from config.FUTURE_COVARIATE_COLS
-  - optional static/regime covariates from config.STATIC_COLS
-
-Targets are computed split-safely inside each split (data_pipeline.label_split_safely)
-to avoid crossing split boundaries.
+Experiment configuration:
+  - 1-hour BTC candles (config.FREQUENCY = "1h")
+  - H-step-ahead 3-class direction classification, where
+        0 = DOWN, 1 = FLAT, 2 = UP
+    and H = config.FORECAST_HORIZONS[0] (e.g. 24 hours ahead).
+  - Target column is config.TRIPLE_DIRECTION_COLUMN ("direction_3c"),
+    created from the H-step forward return using config.DIRECTION_THRESHOLD.
+  - Forward return can be:
+        * log(close_{t+H} / close_t)      if config.USE_LOG_RETURNS = True
+        * close_{t+H} / close_t - 1.0     otherwise
+    (see data_pipeline.add_target_column).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import inspect
 from typing import Dict, Tuple, Optional
 import torch
 from torch.utils.data import DataLoader
@@ -124,45 +119,17 @@ def run_epoch(
     all_true = []
     all_outputs = []
 
-    # Model-compatibility: Experiment 9d introduces x_static, but older models won't accept it yet.
-    forward_params = inspect.signature(model.forward).parameters
-    supports_x_static = "x_static" in forward_params
-
     for batch in data_loader:
-        # Unpack batch.
-        # Possible tuples:
-        #   (x_past, y)
-        #   (x_past, x_future, y)            if only future covariates are enabled
-        #   (x_past, x_static, y)            if only static covariates are enabled
-        #   (x_past, x_future, x_static, y)  if both are enabled (Experiment 9d default)
-        x_future = None
-        x_static = None
-
+        # Unpack batch: either (X_past, y) or (X_past, X_future, y)
         if len(batch) == 2:
             x_past, y = batch
-
+            x_future = None
         elif len(batch) == 3:
-            x_past, x2, y = batch
-
-            # Disambiguate based on config switches
-            if MODEL_CONFIG.use_future_covariates and not MODEL_CONFIG.use_static_covariates:
-                x_future = x2
-            elif MODEL_CONFIG.use_static_covariates and not MODEL_CONFIG.use_future_covariates:
-                x_static = x2
-            else:
-                raise ValueError(
-                    "Got a 3-item batch while BOTH future and static covariates are enabled. "
-                    "Expected (x_past, x_future, x_static, y). "
-                    "Check BTCTFTDataset.__getitem__() and config flags."
-                )
-
-        elif len(batch) == 4:
-            x_past, x_future, x_static, y = batch
-
+            x_past, x_future, y = batch
         else:
             raise ValueError(
-                f"Expected batch of length 2, 3, or 4, got {len(batch)}. "
-                "Check BTCTFTDataset.__getitem__()."
+                f"Expected batch of length 2 or 3, got {len(batch)}. "
+                "Check BTCTFTDataset.__getitem__."
             )
 
         x_past = x_past.to(device)
@@ -171,24 +138,16 @@ def run_epoch(
         if x_future is not None:
             x_future = x_future.to(device)
 
-        if x_static is not None:
-            x_static = x_static.to(device)
-
-        # Forward kwargs: pass what exists.
-        # NOTE: x_static is only passed once tft_model.py supports it.
-        model_kwargs = {}
-        if x_future is not None:
-            model_kwargs["x_future"] = x_future
-        if supports_x_static and (x_static is not None):
-            model_kwargs["x_static"] = x_static
-
         with torch.set_grad_enabled(train):
             # Forward
             if TASK_TYPE == "classification":
                 if criterion is None:
                     raise ValueError("criterion must not be None for classification")
 
-                logits = model(x_past, **model_kwargs)
+                if x_future is not None:
+                    logits = model(x_past, x_future)
+                else:
+                    logits = model(x_past)
 
                 loss = criterion(logits, y)
                 out_for_metrics = logits
@@ -196,7 +155,10 @@ def run_epoch(
 
             elif TASK_TYPE == "quantile_forecast":
                 # y_hat shape: (B, H, Q)
-                y_hat = model(x_past, **model_kwargs)
+                if x_future is not None:
+                    y_hat = model(x_past, x_future)
+                else:
+                    y_hat = model(x_past)
 
                 loss = utils.pinball_loss(
                     y_true=y,
