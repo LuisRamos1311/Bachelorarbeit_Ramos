@@ -1,28 +1,35 @@
 """
 config.py
 
-Central configuration for the TFT BTC up/down / return project.
+Central configuration for the BTC Temporal Fusion Transformer (TFT) pipeline.
 
-This file groups together:
-- Data paths and date ranges
-- Feature definitions (past & known-future covariates)
-- Labeling rules (e.g. what counts as "up")
-- Task configuration (classification vs regression)
-- Model and training hyperparameters
+The current codebase supports ONLY:
+  - TASK_TYPE = "quantile_forecast"  (multi-horizon quantile regression)
 
-Other modules (data_pipeline.py, train_tft.py, tft_model.py, etc.)
-should import from here instead of hardcoding values.
+Key knobs you typically change:
+- Date windows: TRAIN_* / VAL_* / TEST_*
+- Price data frequency / source:
+  - FREQUENCY controls whether the pipeline loads BTC_DAILY_CSV_PATH ("D") or BTC_HOURLY_CSV_PATH ("1h")
+- Optional auxiliary data (merged onto the price timeline):
+  - USE_ONCHAIN adds ONCHAIN_COLS from BTC_ONCHAIN_DAILY_CSV_PATH (with DAILY_FEATURE_LAG_DAYS)
+  - USE_SENTIMENT adds SENTIMENT_COLS from BTC_SENTIMENT_DAILY_CSV_PATH (with DAILY_FEATURE_LAG_DAYS)
+
+This file also defines:
+- Feature lists (past covariates + known-future covariates at t+H)
+- Forecast horizon + quantiles (FORECAST_HORIZON, QUANTILES)
+- Model / training hyperparameters
+- Evaluation & trading signal-threshold defaults
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List
 
 # ============================
 # 1. DATA PATHS
 # ============================
 
-# Folder that contains this experiment (…/project_root/final_model)
+# Folder that contains this final_model code (…/project_root/final_model)
 EXPERIMENT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Top-level project folder one level above (…/project_root)
@@ -31,7 +38,7 @@ PROJECT_ROOT = os.path.dirname(EXPERIMENT_ROOT)
 # Shared data directory at project root
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
-# Experiment-specific output directories (routed under EXPERIMENT_ROOT/standard/)
+# Output directories (routed under EXPERIMENT_ROOT/standard/)
 STANDARD_RUN_DIRNAME = "standard"
 STANDARD_RUN_DIR = os.path.join(EXPERIMENT_ROOT, STANDARD_RUN_DIRNAME)
 
@@ -42,16 +49,16 @@ PLOTS_DIR = os.path.join(STANDARD_RUN_DIR, "plots")
 # Main BTC daily CSV (CryptoDataDownload-style)
 BTC_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_daily.csv")
 
-# NEW: BTC hourly CSV (for Experiment 6)
+# BTC hourly CSV (used when FREQUENCY is hourly)
 BTC_HOURLY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_hourly.csv")
 
-# Optional flag describing the data frequency used in this experiment
-FREQUENCY: str = "1h"  # "D" for daily, "1h" for hourly, etc.
+# Data frequency for the BTC price CSV used in this run
+FREQUENCY: str = "1h"  # "D" for daily bars, "1h" for hourly bars, etc.
 
-# On-chain daily CSV for Experiment 7
+# On-chain daily CSV (used when USE_ONCHAIN is True)
 BTC_ONCHAIN_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_onchain_daily.csv")
 
-# Sentiment daily CSV for Experiment 8 (combined Reddit + Fear & Greed)
+# Sentiment daily CSV (combined Reddit + Fear & Greed)
 # Combined daily sentiment (Reddit Pushshift + Fear & Greed engineered features), fully contiguous daily grid; no NaNs.
 BTC_SENTIMENT_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_sentiment_daily.csv")
 
@@ -72,36 +79,13 @@ TEST_END_DATE    = "2024-12-31"
 
 
 # ============================
-# 3. FEATURES, LABELS & TASK
+# 3. FEATURES & TASK (quantile-only)
 # ============================
 
-# We keep the same label name for now ("direction_3c") so the rest of the pipeline
-# continues to work. In data_pipeline.add_target_column(), we will redefine it to mean:
-#   0 = DOWN  (H-step return < -DIRECTION_THRESHOLD)
-#   1 = FLAT  (|H-step return| <= DIRECTION_THRESHOLD)
-#   2 = UP    (H-step return >  DIRECTION_THRESHOLD)
-# where H = FORECAST_HORIZONS[0] is now measured in *hourly steps* (e.g. 24).
-TRIPLE_DIRECTION_COLUMN: str = "direction_3c"
-
-# For classification tasks, TARGET_COLUMN is the class label column.
-# For quantile forecasting (9c), targets are multi-horizon return columns (TARGET_RET_COLS).
-TARGET_COLUMN: str = TRIPLE_DIRECTION_COLUMN
-DIRECTION_LABEL_COLUMN: str = TRIPLE_DIRECTION_COLUMN
-
-# Number of classes for the direction classification task
-NUM_CLASSES: int = 3
-
-# Symmetric threshold around zero for deciding DOWN / FLAT / UP.
-# When USE_LOG_RETURNS = True this is applied to the H-step *log* return
-# log(close_{t+H} / close_t); for small moves it is still ~equal to a % move.
-# Example: 0.003 ≈ 0.3% absolute move over the horizon.
-DIRECTION_THRESHOLD: float = 0.005
-
-# Whether to construct forward returns as log returns instead of simple
-# percentage returns when building future_return_* and the direction_3c label
+# Whether to construct forward returns as log returns instead of simple percentage returns.
 USE_LOG_RETURNS: bool = True
 
-# Task type: "classification" uses direction_3c, "regression" predicts a continuous return/price
+# This codebase supports ONLY quantile multi-horizon forecasting.
 TASK_TYPE: str = "quantile_forecast"
 
 
@@ -113,23 +97,14 @@ TASK_TYPE: str = "quantile_forecast"
 # For 1h data, 96 = 96 hourly bars of history (~4 days)
 SEQ_LENGTH: int = 96  # 96 hourly bars of history (~4 days)
 
-# -------- Multi-horizon forecasting configuration --------
-#
-# FORECAST_HORIZONS is now interpreted in *time steps*.
-# For hourly data with FORECAST_HORIZONS = [24],
-# this means "next 24 hours" as the prediction horizon.
-FORECAST_HORIZONS: List[int] = [24]
+# -------- Forecast horizon configuration --------
+# Horizon is expressed in time steps (e.g. hours when FREQUENCY="1h").
+FORECAST_HORIZON: int = 24
 
+# Quantiles predicted at each step 1..H
 QUANTILES: List[float] = [0.1, 0.5, 0.9]
-N_QUANTILES: int = len(QUANTILES)
 
-# Canonical single-horizon convenience variable (useful when you want one H everywhere).
-# For now, this equals FORECAST_HORIZONS[0].
-if len(FORECAST_HORIZONS) < 1:
-    raise ValueError("FORECAST_HORIZONS must contain at least one horizon step.")
-FORECAST_HORIZON: int = FORECAST_HORIZONS[0]
-
-# Multi-horizon regression targets (Experiment 9c)
+# Multi-step return targets (y_ret_1 ... y_ret_H)
 TARGET_RET_PREFIX: str = "y_ret_"
 TARGET_RET_COLS: List[str] = [f"{TARGET_RET_PREFIX}{h}" for h in range(1, FORECAST_HORIZON + 1)]
 
@@ -138,16 +113,13 @@ TARGET_RET_COLS: List[str] = [f"{TARGET_RET_PREFIX}{h}" for h in range(1, FORECA
 # to reflect that daily aggregates are only known after day close.
 DAILY_FEATURE_LAG_DAYS: int = 1
 
-# Debug-only integrity checks inside the data pipeline (split boundary + daily-lag sanity).
+# Integrity checks inside the data pipeline (split boundary + daily-lag sanity).
 DEBUG_DATA_INTEGRITY: bool = True
 
 # (Recommended) Strict split-boundary enforcement:
 # If True, drop the final H rows *inside each split* after target creation so that
 # no label / forward return can reference prices beyond that split's end.
 DROP_LAST_H_IN_EACH_SPLIT: bool = True
-
-# Convenience flag: True if we are in a genuine multi-horizon setup.
-USE_MULTI_HORIZON: bool = len(FORECAST_HORIZONS) > 1
 
 # -------- Core price & indicator features (past covariates) --------
 
@@ -180,10 +152,10 @@ ONCHAIN_COLS: List[str] = [
     "hash_ma_ratio",
 ]
 
-USE_ONCHAIN: bool = True  # Experiment 7/8: include on-chain features
+USE_ONCHAIN: bool = False
 
-# Sentiment feature columns (Experiment 8)
-USE_SENTIMENT: bool = True
+# Sentiment feature columns
+USE_SENTIMENT: bool = False
 SENTIMENT_COLS: List[str] = [
     # Reddit (Pushshift daily)
     "reddit_sent_mean",
@@ -212,26 +184,10 @@ FEATURE_COLS: List[str] = (
     + (SENTIMENT_COLS if USE_SENTIMENT else [])
 )
 
-# -------- Calendar & halving features (base + future) --------
-# Base calendar features – attached to each timestamp t.
-# For hourly data, hour_of_day captures intraday patterns (0–23).
-CALENDAR_COLS: List[str] = [
-    "day_of_week",   # 0=Monday, ..., 6=Sunday  (for t)
-    "is_weekend",    # 1 if Saturday/Sunday, else 0 (for t)
-    "month",         # 1–12 (for t)
-    "hour_of_day",   # 0–23 (for t, important for intraday data)
-]
-
-# Base halving-related features – attached to each timestamp t.
-HALVING_COLS: List[str] = [
-    "is_halving_window",     # 1 if within ±N days of a halving, else 0
-    "days_to_next_halving",  # integer days from t to the next halving
-]
-
 # Future (t+H) versions that the model will use as known future covariates.
 # For hourly data, this includes the hour of day at the horizon endpoint,
 # which is fully known in advance (calendar structure).
-FUTURE_KNOWN_COLS: List[str] = [
+FUTURE_COVARIATE_COLS: List[str] = [
     "day_of_week_fut",
     "is_weekend_fut",
     "month_fut",
@@ -239,12 +195,6 @@ FUTURE_KNOWN_COLS: List[str] = [
     "is_halving_window_fut",
     "days_to_next_halving_fut",
 ]
-
-# Full known-future feature list
-KNOWN_FUTURE_COLS: List[str] = FUTURE_KNOWN_COLS
-
-# Alias used by data_pipeline.py
-FUTURE_COVARIATE_COLS: List[str] = KNOWN_FUTURE_COLS
 
 
 # ============================
@@ -286,16 +236,10 @@ class ModelConfig:
     # IMPORTANT: data_pipeline uses FUTURE_COVARIATE_COLS as the official list
     future_input_size: int = len(FUTURE_COVARIATE_COLS)
 
-    # Output size (overridden below for classification)
-    output_size: int = len(FORECAST_HORIZONS)
+    # Quantile-only output head: H * Q
+    output_size: int = FORECAST_HORIZON * len(QUANTILES)
 
 MODEL_CONFIG = ModelConfig()
-
-# Make sure the final layer has the right size for the active task
-if TASK_TYPE == "classification":
-    MODEL_CONFIG.output_size = NUM_CLASSES
-elif TASK_TYPE == "quantile_forecast":
-    MODEL_CONFIG.output_size = FORECAST_HORIZON * N_QUANTILES
 
 
 # ============================
@@ -314,20 +258,11 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 5e-4
 
-    # If pos_weight == 1 -> no reweighting (standard CE).
-    # Only used when TASK_TYPE == "classification".
-    pos_weight: float = 1.0
-
     # Seed for reproducibility (torch, numpy, etc.)
     seed: int = 42
 
     # Gradient clipping (by norm)
     grad_clip: float = 1.0
-
-    # Initial classification threshold (used as a default / fallback).
-    # Final threshold for UP-vs-REST is tuned in evaluate_tft.py.
-    threshold: float = 0.55
-
 
 TRAINING_CONFIG = TrainingConfig()
 
@@ -342,81 +277,28 @@ BEST_MODEL_NAME: str = "tft_btc_best.pth"
 # Full path to the best-model checkpoint (used by both training & evaluation).
 BEST_MODEL_PATH: str = os.path.join(MODELS_DIR, BEST_MODEL_NAME)
 
-# Default threshold to use during final evaluation on the test set.
-# Only meaningful for classification tasks.
-EVAL_THRESHOLD: float = TRAINING_CONFIG.threshold
+# ----------------------------
+# Threshold / signal configuration (quantile_forecast only)
+# ----------------------------
+
+# Which horizon step you trade on (typically equal to FORECAST_HORIZON)
+SIGNAL_HORIZON: int = FORECAST_HORIZON
+
+# For score = mu / (iqr + eps)
+SCORE_EPS: float = 1e-6
 
 # ----------------------------
-# Threshold tuning configuration
+# ACTIVE signal-threshold settings (quantile-only)
 # ----------------------------
-# These settings are only relevant when TASK_TYPE == "classification".
+ACTIVE_SIGNAL_NAME: str = "score"
+ACTIVE_SELECTION_METRIC: str = "sharpe"
+ACTIVE_AUTO_TUNE: bool = True
 
-# If True, evaluate_tft will:
-#   1) Run the model on the *validation* set,
-#   2) Grid-search over a range of thresholds,
-#   3) Pick the threshold that maximizes THRESHOLD_TARGET_METRIC
-#      on the validation set,
-#   4) Use that threshold for computing test metrics.
-AUTO_TUNE_THRESHOLD: bool = True
-
-# Range of thresholds to search over [min, max] (inclusive, via linspace).
-THRESHOLD_SEARCH_MIN: float = 0.10
-THRESHOLD_SEARCH_MAX: float = 0.90
-THRESHOLD_SEARCH_STEPS: int = 17  # e.g. 0.10, 0.15, ..., 0.90
-
-# Which metric to maximize during tuning: "f1", "accuracy",
-# "precision", or "recall".
-THRESHOLD_TARGET_METRIC: str = "f1"
-
-# ----------------------------
-# Experiment 5c-style: UP-vs-REST threshold grid
-# ----------------------------
-UP_THRESHOLD_GRID = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
-
-# Metric to use when selecting τ* from UP_THRESHOLD_GRID on the validation set.
-THRESHOLD_SELECTION_METRIC: str = "sharpe"
-
-SIGNAL_HORIZON: int = FORECAST_HORIZON     # which step you trade on (use 24 first)
-SCORE_EPS: float = 1e-6                    # for mu/(iqr+eps)
-SCORE_GRID = [0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.045, 0.050, 0.055]
-
-# Percentile grid for score thresholds (values must be between 0.0 and 1.0)
-# Example: 0.90 means “threshold is the 90th percentile of validation scores”
-SCORE_PERCENTILE_GRID = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
-
-# Choose how thresholds are interpreted in quantile mode:
-#   "absolute"   -> use SCORE_GRID values directly
-#   "percentile" -> convert SCORE_PERCENTILE_GRID into real thresholds using validation score percentiles
-SCORE_THRESHOLD_MODE: str = "percentile"
-
-# ----------------------------
-# ACTIVE signal-threshold settings (foolproof)
-# ----------------------------
-# These are the ONLY variables evaluation should use going forward.
-# They select the correct signal + grid depending on TASK_TYPE.
-
-if TASK_TYPE == "classification":
-    ACTIVE_SIGNAL_NAME: str = "p_up"
-    ACTIVE_THRESHOLD_GRID = UP_THRESHOLD_GRID
-    ACTIVE_SELECTION_METRIC: str = THRESHOLD_SELECTION_METRIC
-    ACTIVE_AUTO_TUNE: bool = AUTO_TUNE_THRESHOLD
-elif TASK_TYPE == "quantile_forecast":
-    ACTIVE_SIGNAL_NAME: str = "score"
-    ACTIVE_THRESHOLD_GRID_MODE: str = SCORE_THRESHOLD_MODE
-    ACTIVE_THRESHOLD_GRID = SCORE_PERCENTILE_GRID if SCORE_THRESHOLD_MODE == "percentile" else SCORE_GRID
-    ACTIVE_SELECTION_METRIC: str = "sharpe"  # keep consistent with your outline
-    ACTIVE_AUTO_TUNE: bool = True
-else:
-    raise ValueError(f"Unsupported TASK_TYPE: {TASK_TYPE}")
-
-if TASK_TYPE == "quantile_forecast":
-    # Guardrail: if someone accidentally tries to use classification-only thresholding
-    # in quantile mode, they should notice immediately.
-    assert ACTIVE_SIGNAL_NAME == "score"
-    if SCORE_THRESHOLD_MODE == "percentile":
-        assert ACTIVE_THRESHOLD_GRID == SCORE_PERCENTILE_GRID
-    else:
-        assert ACTIVE_THRESHOLD_GRID == SCORE_GRID
+# Thresholds are interpreted as percentiles of validation scores (quantile-only).
+ACTIVE_THRESHOLD_GRID_MODE: str = "percentile"
+ACTIVE_THRESHOLD_GRID: List[float] = [
+    0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95
+]
 
 # ----------------------------
 # Trading / evaluation options
@@ -426,7 +308,7 @@ if TASK_TYPE == "quantile_forecast":
 NON_OVERLAPPING_TRADES: bool = True
 
 # ----------------------------
-# Experiment 9b: backtest assumptions (costs + annualization + baselines)
+# Backtest assumptions (costs + annualization + baselines)
 # ----------------------------
 
 # Crypto trades 365 days/year, so Sharpe annualization should use 365 (not 252).

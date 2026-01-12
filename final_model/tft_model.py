@@ -1,27 +1,21 @@
 """
 tft_model.py
 
-Defines a simplified Temporal Fusion Transformer-style model for
-logits or outputs for the configured task.
+Defines a simplified Temporal Fusion Transformer-style model for BTC.
 
-Current architecture (with optional VSNs, gating and known future inputs):
+The model supports one task mode controlled by config / ModelConfig:
+  - "quantile_forecast":
+      outputs quantile forecasts for the H-step return path:
+        raw head: (B, H*Q) where output_size = H*Q
+        reshaped: (B, H, Q)
 
-1. Variable Selection Network (VSN) or linear projection from raw
-   input features to a shared hidden size.
-2. LSTM encoder over the past time steps.
-3. Multi-head self-attention over the encoded sequence.
-4. Temporal feed-forward / gating block (Gated Residual Networks or
-   residual MLP).
-5. Optional future covariate encoder (calendar + halving info for t+H,
-   where H is the main forecast horizon).
-6. Additional on-chain features.
-
-The model is configured for:
-    - H-step-ahead 3-class direction classification (0=DOWN, 1=FLAT, 2=UP)
-    - output_size = NUM_CLASSES (from config)
-
-For future experiments, you can change config.FORECAST_HORIZONS and
-config.TASK_TYPE; the core model does not need to change.
+Architecture (simplified):
+1) Optional Variable Selection Network (VSN) or linear projection of past inputs
+2) LSTM encoder over past sequence
+3) Multi-head self-attention over encoded sequence
+4) Temporal feed-forward block (GRN-gated or residual MLP)
+5) Optional future-covariate encoder for t+H known features (calendar/halving)
+6) Output head determined by output_size (see above)
 """
 
 from __future__ import annotations
@@ -251,24 +245,21 @@ class TemporalFusionTransformer(nn.Module):
     Expected input:
         x_past:
             Tensor of shape (batch_size, seq_length, input_size)
-            Past covariates (OHLCV + indicators + on-chain) as built in
-            data_pipeline.py using FEATURE_COLS (incl. ONCHAIN_COLS).
+            Past covariates (OHLCV + technical indicators + optional external features)
+            as built in data_pipeline.py using FEATURE_COLS (the exact set depends on
+            your enabled data sources / toggles).
         x_future:
             Optional tensor of shape (batch_size, future_input_size)
             Known future covariates for t+H (calendar + halving), where
-            H = config.FORECAST_HORIZONS[0]. If
+            H = config.FORECAST_HORIZON. If
             config.MODEL_CONFIG.use_future_covariates is True, x_future
             must be provided.
 
-    Output (Experiment 6 configuration):
-        outputs:
-            Tensor of shape (batch_size, NUM_CLASSES)
-            3-class logits for H-step-ahead direction:
-                0 = DOWN, 1 = FLAT, 2 = UP
-
-    If return_attention=True, the forward pass also returns the attention
-    weights from the multi-head attention layer, which can be used later
-    for interpretability plots in the thesis.
+    Output:
+        - quantile_forecast:
+            quantile predictions reshaped to (batch_size, H, Q),
+            where H = config.FORECAST_HORIZON and Q = len(config.QUANTILES)
+            (implemented via output_size = H * Q).
 
     Advanced options controlled via config.ModelConfig:
         - use_gating:
@@ -310,10 +301,6 @@ class TemporalFusionTransformer(nn.Module):
             dropout=dropout,
             use_gating=self.config.use_gating,
         )
-
-        # This will store the latest selection weights for interpretability
-        # (optional; you can access model.last_vsn_weights after a forward pass).
-        self.last_vsn_weights: torch.Tensor | None = None
 
         # -------- 2. LSTM encoder --------
         # Processes the sequence over time. We use batch_first=True so that
@@ -382,8 +369,8 @@ class TemporalFusionTransformer(nn.Module):
             self.ffn_layer_norm = nn.LayerNorm(hidden_size)
 
         # -------- 5. Future covariate encoder (optional) --------
-        # Encodes known future covariates (calendar + halving info for t+1)
-        # into a hidden_size context vector.
+        # Encodes known-future covariates aligned to the forecast endpoint (t+H),
+        # where H = config.FORECAST_HORIZON, into a hidden_size context vector.
         if self.config.use_future_covariates and self.config.future_input_size > 0:
             if self.config.use_gating:
                 # GRN-based encoder for future covariates
@@ -421,20 +408,49 @@ class TemporalFusionTransformer(nn.Module):
         # We aggregate over time (last time step), optionally fuse
         # with future covariates, and map hidden_size → output_size.
         #
-        # Output head:
-        # - classification: output_size = NUM_CLASSES  -> (B, 3)
-        # - quantile_forecast (9c): output_size = H * Q -> (B, H*Q) then reshape to (B, H, Q)
+        # Output head (quantile-only):
+        # output_size = H * Q -> raw (B, H*Q) then reshape to (B, H, Q)
         self.output_layer = nn.Linear(hidden_size, self.config.output_size)
+
+        # -------- Quantile-head shape contract (fail fast) --------
+        # Canonical API: config.FORECAST_HORIZON (int) + config.QUANTILES (list[float])
+        self.horizon: int = int(config.FORECAST_HORIZON)
+        self.quantiles: tuple[float, ...] = tuple(config.QUANTILES)
+        self.n_quantiles: int = len(self.quantiles)
+
+
+        if self.horizon <= 0:
+            raise ValueError(f"FORECAST_HORIZON must be > 0, got {self.horizon}.")
+        if self.n_quantiles <= 0:
+            raise ValueError("QUANTILES must be a non-empty list.")
+        if any((q <= 0.0 or q >= 1.0) for q in self.quantiles):
+            raise ValueError(f"All QUANTILES must be in (0,1), got {self.quantiles}.")
+
+        self.expected_output_size: int = self.horizon * self.n_quantiles
+
+        if self.config.output_size != self.expected_output_size:
+            raise ValueError(
+                f"[tft_model] MODEL_CONFIG.output_size mismatch: "
+                f"got {self.config.output_size} but expected H*Q={self.expected_output_size} "
+                f"(H={self.horizon}, Q={self.n_quantiles}). "
+                f"Fix config.MODEL_CONFIG.output_size or (preferably) keep it derived from "
+                f"FORECAST_HORIZON * len(QUANTILES)."
+            )
+
+        # Extra guard: output layer must agree with the contract.
+        if self.output_layer.out_features != self.expected_output_size:
+            raise ValueError(
+                f"[tft_model] output_layer.out_features mismatch: "
+                f"got {self.output_layer.out_features} but expected {self.expected_output_size}."
+            )
 
     def forward(
         self,
         x_past: torch.Tensor,
         x_future: torch.Tensor | None = None,
-        return_attention: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Forward pass of the TFT model.
-
         Args:
             x_past:
                 Past covariates, tensor of shape (batch_size, seq_length, input_size).
@@ -443,18 +459,9 @@ class TemporalFusionTransformer(nn.Module):
                 (batch_size, future_input_size). If
                 config.MODEL_CONFIG.use_future_covariates is True, this must
                 be provided. If the flag is False, x_future is ignored.
-            return_attention:
-                If True, also return the attention weights from the
-                multi-head attention layer.
-
         Returns:
             outputs:
-                Tensor of shape (batch_size, output_size).
-                In this single-horizon classification setup, this is (B, 3) logits (DOWN/FLAT/UP).
-            attn_weights (optional):
-                Tensor of shape (batch_size, seq_length, seq_length) with
-                attention weights over time. Only returned if
-                return_attention=True.
+                Tensor of shape (batch_size, H, Q) containing quantile forecasts.
         """
         # x_past: (B, T, F)
         batch_size, seq_length, input_size = x_past.shape
@@ -465,7 +472,7 @@ class TemporalFusionTransformer(nn.Module):
                 f"{self.config.input_size} (len(FEATURE_COLS)), but got "
                 f"{input_size}. This usually means a mismatch between "
                 f"the features used to build x_past and config.FEATURE_COLS "
-                f"(including ONCHAIN_COLS in Experiment 7). "
+                f"(including ONCHAIN_COLS). "
                 f"Check config.FEATURE_COLS / config.ONCHAIN_COLS and the "
                 f"shape of the tensor you pass into the model."
             )
@@ -498,14 +505,11 @@ class TemporalFusionTransformer(nn.Module):
 
         # ---- Step 1: Variable selection or simple projection ----
         if self.config.use_variable_selection:
-            # x_proj: (B, T, H), vsn_weights: (B, T, F)
-            x_proj, vsn_weights = self.vsn_past(x_past)
-            # Store for potential interpretability later
-            self.last_vsn_weights = vsn_weights
+            # x_proj: (B, T, H)
+            x_proj, _ = self.vsn_past(x_past)
         else:
             # Plain linear projection: (B, T, F) -> (B, T, H)
             x_proj = self.input_projection(x_past)
-            self.last_vsn_weights = None
 
         # ---- Step 2: LSTM encoder ----
         # lstm_out: (B, T, H)
@@ -524,8 +528,8 @@ class TemporalFusionTransformer(nn.Module):
         # ---- Step 3: Multi-head self-attention ----
         # Self-attention uses the same tensor for query, key, and value.
         # attn_raw: (B, T, H)
-        # attn_weights: (B, T, T) - how much each time step attends to others.
-        attn_raw, attn_weights = self.attention(enc, enc, enc)
+        # We don't return attention weights in the simplified final model.
+        attn_raw, _ = self.attention(enc, enc, enc)
 
         if self.config.use_gating:
             # Apply a GRN to the attention output. GRN internally handles
@@ -547,7 +551,7 @@ class TemporalFusionTransformer(nn.Module):
         # ---- Step 5: Aggregate over time ----
         # Use the representation of the LAST time step as summary of the
         # whole history window.
-        # last_timestep: (B, H)
+        # last_timestep: (B, hidden_size)
         last_timestep = ff_out[:, -1, :]
 
         # ---- Step 6: Fuse with future covariates (if used) ----
@@ -575,27 +579,15 @@ class TemporalFusionTransformer(nn.Module):
         # ---- Step 7: Final output layer ----
         raw = self.output_layer(fusion_output)  # (B, output_size)
 
-        task_type = getattr(config, "TASK_TYPE", "classification")
+        # Quantile-only head: reshape (B, H*Q) -> (B, H, Q)
+        expected = self.expected_output_size
+        if raw.shape[-1] != expected:
+            raise ValueError(
+                f"[tft_model] Output size mismatch: got {raw.shape[-1]} but expected {expected} "
+                f"(H={self.horizon}, Q={self.n_quantiles}). "
+                f"Check config.FORECAST_HORIZON / config.QUANTILES and config.MODEL_CONFIG.output_size."
+            )
 
-        if task_type in ("quantile_forecast", "regression_quantile"):
-            # Expect raw to be (B, H*Q) -> reshape to (B, H, Q)
-            H = int(getattr(config, "FORECAST_HORIZON", getattr(config, "FORECAST_HORIZONS", [1])[0]))
-            quantiles = getattr(config, "QUANTILES", [0.5])
-            Q = int(getattr(config, "N_QUANTILES", len(quantiles)))
-
-            expected = H * Q
-            if raw.shape[-1] != expected:
-                raise ValueError(
-                    f"[tft_model] Output size mismatch for quantile_forecast: "
-                    f"got {raw.shape[-1]} but expected H*Q={expected} (H={H}, Q={Q}). "
-                    f"Check config.MODEL_CONFIG.output_size."
-                )
-
-            outputs = raw.view(raw.size(0), H, Q)  # (B, H, Q)
-        else:
-            outputs = raw  # classification logits etc.
-
-        if return_attention:
-            return outputs, attn_weights
+        outputs = raw.view(raw.size(0), self.horizon, self.n_quantiles)  # (B, H, Q)
 
         return outputs
