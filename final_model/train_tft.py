@@ -205,8 +205,11 @@ def main() -> None:
     print(
         f"[train_tft] Run setup: {horizon_desc} quantile multi-horizon "
         f"H={cfg.FORECAST_HORIZON} | FREQUENCY='{cfg.FREQUENCY}' | "
-        f"USE_ONCHAIN={cfg.USE_ONCHAIN} (cols={len(cfg.ONCHAIN_COLS)}) | "
-        f"USE_SENTIMENT={cfg.USE_SENTIMENT} (cols={len(cfg.SENTIMENT_COLS)})"
+        f"USE_OHLCV={cfg.USE_OHLCV} (active_cols={len(cfg.PRICE_VOLUME_COLS) if cfg.USE_OHLCV else 0}) | "
+        f"USE_TALIB_INDICATORS={cfg.USE_TALIB_INDICATORS} (active_cols={len(cfg.INDICATOR_COLS) if cfg.USE_TALIB_INDICATORS else 0}) | "
+        f"USE_ONCHAIN={cfg.USE_ONCHAIN} (active_cols={len(cfg.ONCHAIN_COLS) if cfg.USE_ONCHAIN else 0}) | "
+        f"USE_SENTIMENT={cfg.USE_SENTIMENT} (active_cols={len(cfg.SENTIMENT_COLS) if cfg.USE_SENTIMENT else 0}) | "
+        f"TOTAL_FEATURES={len(cfg.FEATURE_COLS)}"
     )
 
     # 1) Prepare datasets (explicitly pass SEQ_LENGTH to keep training/eval aligned)

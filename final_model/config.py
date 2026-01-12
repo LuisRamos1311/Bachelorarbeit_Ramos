@@ -123,6 +123,12 @@ DROP_LAST_H_IN_EACH_SPLIT: bool = True
 
 # -------- Core price & indicator features (past covariates) --------
 
+# Toggle which feature groups are fed into the model as past covariates
+USE_OHLCV: bool = False
+USE_TALIB_INDICATORS: bool = True
+USE_ONCHAIN: bool = True
+USE_SENTIMENT: bool = True
+
 # Price & volume columns that will be scaled with MinMaxScaler
 PRICE_VOLUME_COLS: List[str] = [
     "open",
@@ -152,10 +158,7 @@ ONCHAIN_COLS: List[str] = [
     "hash_ma_ratio",
 ]
 
-USE_ONCHAIN: bool = False
-
 # Sentiment feature columns
-USE_SENTIMENT: bool = False
 SENTIMENT_COLS: List[str] = [
     # Reddit (Pushshift daily)
     "reddit_sent_mean",
@@ -178,11 +181,16 @@ BINARY_COLS: List[str] = [
 
 # Full list of feature columns fed into the model as PAST covariates
 FEATURE_COLS: List[str] = (
-    PRICE_VOLUME_COLS
-    + INDICATOR_COLS
+    (PRICE_VOLUME_COLS if USE_OHLCV else [])
+    + (INDICATOR_COLS if USE_TALIB_INDICATORS else [])
     + (ONCHAIN_COLS if USE_ONCHAIN else [])
     + (SENTIMENT_COLS if USE_SENTIMENT else [])
 )
+if len(FEATURE_COLS) == 0:
+    raise ValueError(
+        "FEATURE_COLS is empty. Enable at least one of: "
+        "USE_OHLCV / USE_TALIB_INDICATORS / USE_ONCHAIN / USE_SENTIMENT."
+    )
 
 # Future (t+H) versions that the model will use as known future covariates.
 # For hourly data, this includes the hour of day at the horizon endpoint,
