@@ -124,7 +124,7 @@ DROP_LAST_H_IN_EACH_SPLIT: bool = True
 # -------- Core price & indicator features (past covariates) --------
 
 # Toggle which feature groups are fed into the model as past covariates
-USE_OHLCV: bool = False
+USE_OHLCV: bool = True
 USE_TALIB_INDICATORS: bool = True
 USE_ONCHAIN: bool = True
 USE_SENTIMENT: bool = True
