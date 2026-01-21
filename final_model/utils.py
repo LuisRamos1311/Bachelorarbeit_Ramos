@@ -861,15 +861,13 @@ def plot_signal_confusion_matrix(
     actual_up: Any,
     model_long: Any,
     out_path: str,
-    title: str = "Signal confusion (Actual up? vs Model long?)",
+    title: str = "Trading signal confusion matrix",
 ) -> None:
     """
     Plot a 2x2 confusion matrix for the trading signal (decision vs outcome).
 
-    Rows are the realized outcome (`actual_up`: 1 if the realized forward return is > 0 else 0).
-    Columns are the model decision (`model_long`: 1 if the strategy goes long else 0).
-
-    This is *not* a model-classification confusion matrix; it diagnoses the long/flat timing rule.
+    Rows: realized outcome (actual_up = 1 if realized forward return > 0 else 0)
+    Cols: strategy decision (model_long = 1 if long else 0)
     """
     y_true = _to_numpy_1d(actual_up).astype(int)
     y_pred = _to_numpy_1d(model_long).astype(int)
@@ -889,24 +887,44 @@ def plot_signal_confusion_matrix(
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(5, 4))
+    fig, ax = plt.subplots(figsize=(6, 4.5))
     im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
-    ax.figure.colorbar(im, ax=ax)
+    cbar = ax.figure.colorbar(im, ax=ax)
 
-    labels = ["No", "Yes"]
+    # Thesis-like labels
+    outcome_labels = ["Down", "Up"]
+    decision_labels = ["Flat", "Long"]
+
     ax.set(
         xticks=np.arange(2),
         yticks=np.arange(2),
-        xticklabels=labels,
-        yticklabels=labels,
-        ylabel="Actual up?",
-        xlabel="Model long?",
+        xticklabels=decision_labels,
+        yticklabels=outcome_labels,
+        ylabel="Realized outcome",
+        xlabel = "Model decision",
         title=title,
     )
 
+    # Adjust the fontsize of labels
+    ax.set_xlabel("Model decision", fontsize=14)
+    ax.set_ylabel("Realized outcome", fontsize=14)
+    ax.set_title(title, fontsize=15)
+
+    ax.tick_params(axis="both", which="major", labelsize=12)
+    cbar.ax.tick_params(labelsize=12)
+
+    # Make the numbers readable on dark cells
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.0
     for i in range(2):
         for j in range(2):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=12)
+            val = cm[i, j]
+            txt_color = "white" if val > thresh else "black"
+            ax.text(
+                j, i, f"{val}",
+                ha="center", va="center",
+                fontsize=13, fontweight="bold",
+                color=txt_color,
+            )
 
     fig.tight_layout()
     fig.savefig(out_path)

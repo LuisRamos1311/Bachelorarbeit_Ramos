@@ -69,12 +69,12 @@ BTC_SENTIMENT_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTC_sentiment_daily.csv")
 
 # Adjust these if your BTCUSD_hourly.csv covers a different period.
 TRAIN_START_DATE = "2016-01-01"
-TRAIN_END_DATE   = "2020-12-31"
+TRAIN_END_DATE   = "2022-12-31"
 
-VAL_START_DATE   = "2021-01-01"
-VAL_END_DATE     = "2021-10-31"
+VAL_START_DATE   = "2023-01-01"
+VAL_END_DATE     = "2023-12-31"
 
-TEST_START_DATE  = "2021-11-01"
+TEST_START_DATE  = "2024-01-01"
 TEST_END_DATE    = "2024-12-31"
 
 

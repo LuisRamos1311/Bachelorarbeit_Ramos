@@ -614,7 +614,6 @@ def main() -> None:
             y_pred_q=y_pred_sig_q,
             quantiles=quantiles,
             out_path=forecast_band_path,
-            title=f"Test forecast band (signal={signal_h})",
             q_low=0.1,
             q_mid=0.5,
             q_high=0.9,
@@ -625,7 +624,6 @@ def main() -> None:
         utils.plot_threshold_sweep(
             sweep_records=sweep_records,
             out_path=threshold_sweep_plot_path,
-            title=f"Threshold sweep (val {selection_metric})",
             selected_threshold=thr_star,
         )
 
@@ -642,7 +640,6 @@ def main() -> None:
             equity_strategy=test_equity,
             equity_buy_hold=bh_equity_test,
             out_path=equity_curve_path,
-            title=f"Test equity curves (net)  τ*={thr_star:.3f}",
         )
 
         # Step 2.5 — Signal confusion matrix (2×2)
@@ -653,7 +650,6 @@ def main() -> None:
             actual_up=y_true_up,
             model_long=y_pred_long,
             out_path=signal_confusion_path,
-            title=f"Test signal confusion (τ*={thr_star:.3f})",
         )
 
         # Step 2.6 — Write the 2 tables

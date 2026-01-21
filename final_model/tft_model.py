@@ -310,7 +310,7 @@ class TemporalFusionTransformer(nn.Module):
             hidden_size=hidden_size,
             num_layers=self.config.lstm_layers,
             batch_first=True,
-            bidirectional=False,  # keep it simple: single direction
+            bidirectional=False,  # single direction
         )
 
         # When gating is disabled, we keep simple residual + LayerNorm blocks.
