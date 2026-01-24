@@ -28,12 +28,13 @@ import talib  # Technical Analysis library (C + Python wrapper)
 from final_model import config
 from torch.utils.data import Dataset
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-
+# Public API (used by training/evaluation scripts):
+# - prepare_datasets(...): builds train/val/test BTCTFTDataset objects
+# - BTCTFTDataset: the PyTorch Dataset wrapper returned by prepare_datasets()
 
 # ============================
 # 1. LOADING & PREPROCESSING
 # ============================
-
 def load_btc_daily(csv_path: str | None = None) -> pd.DataFrame:
     """
     Load daily BTC data from a CryptoDataDownload CSV and return a cleaned DataFrame.
@@ -288,6 +289,7 @@ def add_onchain_features(hourly_df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def load_sentiment_daily(csv_path: str | None = None) -> pd.DataFrame:
     """
     Load the combined DAILY sentiment dataset (Reddit Pushshift + Fear & Greed)
@@ -331,6 +333,7 @@ def load_sentiment_daily(csv_path: str | None = None) -> pd.DataFrame:
         )
 
     return df
+
 
 def add_sentiment_features(hourly_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -409,7 +412,6 @@ def add_sentiment_features(hourly_df: pd.DataFrame) -> pd.DataFrame:
 # ============================
 # 2. TECHNICAL INDICATORS
 # ============================
-
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add technical indicators using TA-Lib.
@@ -460,7 +462,6 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ============================
 # 3. CALENDAR & HALVING FEATURES
 # ============================
-
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add per-timestep calendar features:
@@ -609,12 +610,23 @@ def add_future_covariates(df: pd.DataFrame) -> pd.DataFrame:
 # ============================
 # 4. TARGETS
 # ============================
-
 def compute_future_return(close: pd.Series, h: int, use_log_returns: bool) -> pd.Series:
+    """
+    Compute the forward return from time t to time t+h.
+
+    Args:
+        close: Close price series indexed by time.
+        h: Horizon step (1..H). Uses shift(-h), so the last h rows become NaN.
+        use_log_returns: If True, use log returns; otherwise simple returns.
+
+    Returns:
+        A pd.Series of forward returns aligned to time t.
+    """
     if use_log_returns:
         return np.log(close.shift(-h) / close)
     else:
         return close.shift(-h) / close - 1.0
+
 
 def add_multi_horizon_targets(df: pd.DataFrame, H: int, use_log_returns: bool) -> pd.DataFrame:
     """
@@ -633,7 +645,6 @@ def add_multi_horizon_targets(df: pd.DataFrame, H: int, use_log_returns: bool) -
 # ============================
 # 5. TRAIN / VAL / TEST SPLIT
 # ============================
-
 def split_by_date(
     df: pd.DataFrame,
     train_start: str = config.TRAIN_START_DATE,
@@ -661,7 +672,6 @@ def split_by_date(
 # ============================
 # 6. FEATURE SCALING
 # ============================
-
 def scale_features(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -760,7 +770,6 @@ def scale_features(
 # ============================
 # 7. SEQUENCE CREATION
 # ============================
-
 def build_sequences(
     df: pd.DataFrame,
     feature_cols: List[str],
@@ -775,6 +784,12 @@ def build_sequences(
       - X_past:  df[feature_cols] from [t-seq_length+1 .. t]   -> (seq_length, n_features)
       - y:       df[target_cols] at t                          -> (H,)
       - X_future (optional): df[future_cols] at t              -> (n_future_features,)
+
+    Shape glossary:
+      - N = number of samples (windows)
+      - H = config.FORECAST_HORIZON (targets per sample)
+      - n_features = len(feature_cols)
+      - n_future_features = len(future_cols) if provided
 
     Returns:
       sequences_arr: (N, seq_length, n_features) float32
@@ -848,7 +863,6 @@ def build_sequences(
 # ============================
 # 8. PYTORCH DATASET
 # ============================
-
 class BTCTFTDataset(Dataset):
     """
     Simple PyTorch Dataset for the BTC TFT model.
@@ -891,6 +905,7 @@ class BTCTFTDataset(Dataset):
         else:
             return self.sequences[idx], self.future_covariates[idx], self.labels[idx]
 
+
 # Compute targets *inside a split*
 def label_split_safely(df_split: pd.DataFrame, split_name: str) -> pd.DataFrame:
     """
@@ -930,6 +945,7 @@ def label_split_safely(df_split: pd.DataFrame, split_name: str) -> pd.DataFrame:
                     f"> last_allowed_ts={last_allowed_ts} (split_end={end_ts_before}, H={H})"
                 )
     return df_labeled
+
 
 def _debug_check_daily_lag_alignment(
     split_df: pd.DataFrame,
@@ -1006,7 +1022,6 @@ def _debug_check_daily_lag_alignment(
 # ============================
 # 9. HIGH-LEVEL PIPELINE
 # ============================
-
 def prepare_datasets(
     csv_path: str | None = None,
     seq_length: int = config.SEQ_LENGTH,
@@ -1086,7 +1101,11 @@ def prepare_datasets(
     val_df = label_split_safely(val_df, "VAL")
     test_df = label_split_safely(test_df, "TEST")
 
-    # 6.1 Debug-only: verify daily feature availability lagging
+    # ----------------------------
+    # Debug-only integrity checks
+    # ----------------------------
+    # Verifies that daily features were merged using the intended lag rule:
+    # daily_key = floor(t) - DAILY_FEATURE_LAG_DAYS
     if config.DEBUG_DATA_INTEGRITY:
         lag_days = int(config.DAILY_FEATURE_LAG_DAYS)
 

@@ -19,17 +19,20 @@ Quantile training:
 
 Train/val/test date windows, FREQUENCY, and data-source toggles (USE_ONCHAIN,
 USE_SENTIMENT) are configured in config.py.
+
+Mental model:
+- data_pipeline prepares (x_past, [x_future], y) windows
+- model predicts quantiles y_hat with shape (B, H, Q)
+- training minimizes pinball loss across all horizons and quantiles
+- we log MAE on the median (q=0.5) at horizon H for a simple sanity-check metric
 """
 
 from __future__ import annotations
-
 import json
 import os
 from typing import Dict, Optional, Tuple
-
 import torch
 from torch.utils.data import DataLoader
-
 from final_model import config as cfg
 from final_model.data_pipeline import prepare_datasets
 from final_model.tft_model import TemporalFusionTransformer
@@ -37,140 +40,7 @@ from final_model import utils
 
 
 # ============================================================
-# 1. DATALOADER CREATION
-# ============================================================
-
-
-def create_dataloaders(
-    train_dataset,
-    val_dataset,
-    batch_size: int,
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Wrap PyTorch Datasets into DataLoaders.
-    """
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-    )
-
-    return train_loader, val_loader
-
-
-# ============================================================
-# 2. SINGLE-EPOCH TRAINING / EVAL
-# ============================================================
-
-
-def run_epoch(
-    model: torch.nn.Module,
-    data_loader: DataLoader,
-    device: torch.device,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    train: bool = True,
-) -> Dict[str, float]:
-    """
-    Run one epoch of quantile-forecast training or evaluation.
-
-    Batch format (from BTCTFTDataset):
-      - (x_past, y) when no future covariates are provided
-      - (x_past, x_future, y) when known-future covariates are enabled
-
-    Shapes:
-      - x_past:   (B, SEQ_LENGTH, input_size)
-      - x_future: (B, future_input_size)  (per-sample vector aligned to step t+H)
-      - y:        (B, H)
-      - y_hat:    (B, H, Q)
-
-    Returns:
-      {"loss": avg_pinball, "mae": avg_mae_at_H}
-      where mae is computed on q=0.5 at horizon FORECAST_HORIZON.
-    """
-    if train:
-        model.train()
-    else:
-        model.eval()
-
-    if train and optimizer is None:
-        raise ValueError("optimizer must not be None when train=True")
-
-    total_loss = 0.0
-    total_mae = 0.0
-    num_samples = 0
-
-    for batch in data_loader:
-        # Unpack batch: either (X_past, y) or (X_past, X_future, y)
-        if len(batch) == 2:
-            x_past, y = batch
-            x_future = None
-        elif len(batch) == 3:
-            x_past, x_future, y = batch
-        else:
-            raise ValueError(
-                f"Expected batch of length 2 or 3, got {len(batch)}. "
-                "Check BTCTFTDataset.__getitem__."
-            )
-
-        x_past = x_past.to(device)
-        y = y.to(device)
-        if x_future is not None:
-            x_future = x_future.to(device)
-
-        with torch.set_grad_enabled(train):
-            # Forward
-            if x_future is not None:
-                y_hat = model(x_past, x_future)  # (B, H, Q)
-            else:
-                y_hat = model(x_past)  # (B, H, Q)
-
-            # Loss
-            loss = utils.pinball_loss(y_true=y, y_pred=y_hat, quantiles=cfg.QUANTILES)
-
-            # MAE on q=0.5 at horizon FORECAST_HORIZON
-            batch_mae = utils.mae_on_median_at_horizon(
-                y_true=y,
-                y_pred=y_hat,
-                quantiles=cfg.QUANTILES,
-                horizon_step=cfg.FORECAST_HORIZON,
-            )
-
-            # Backward + optimize
-            if train:
-
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-
-                clip_value = cfg.TRAINING_CONFIG.grad_clip
-                if clip_value is not None and clip_value > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
-
-                optimizer.step()
-
-        batch_size = y.size(0)
-        total_loss += float(loss.item()) * batch_size
-        total_mae += float(batch_mae) * batch_size
-        num_samples += batch_size
-
-    if num_samples == 0:
-        raise RuntimeError("DataLoader has zero samples in run_epoch().")
-
-    return {
-        "loss": total_loss / num_samples,
-        "mae": total_mae / num_samples,
-    }
-
-
-# ============================================================
-# 3. MAIN TRAINING LOOP
+# 1. MAIN TRAINING LOOP
 # ============================================================
 
 def main() -> None:
@@ -183,7 +53,8 @@ def main() -> None:
     utils.set_seed(cfg.TRAINING_CONFIG.seed)
     device = utils.get_device()
 
-    # Safety: refuse to start a new run if "standard" already has content
+    # This prevents accidentally overwriting a previous "standard/" run.
+    # If you want multiple runs, rename STANDARD_RUN_DIRNAME or archive old runs.
     utils.guard_dir_missing_or_empty(cfg.STANDARD_RUN_DIR, display_name=cfg.STANDARD_RUN_DIRNAME)
 
     # Normal directory creation under standard/
@@ -214,6 +85,8 @@ def main() -> None:
 
     # 1) Prepare datasets (explicitly pass SEQ_LENGTH to keep training/eval aligned)
     print("[train_tft] Preparing datasets.")
+    # prepare_datasets() returns (train, val, test, scalers).
+    # Training only uses train/val; evaluation uses test + forward returns.
     train_dataset, val_dataset, _test_dataset, _scalers = prepare_datasets(
         seq_length=cfg.SEQ_LENGTH
     )
@@ -336,6 +209,149 @@ def main() -> None:
         f"  History JSON:    {history_path}\n"
         f"  Training curves: {curves_path}"
     )
+
+
+# ============================================================
+# 2. DATALOADER CREATION
+# ============================================================
+
+
+def create_dataloaders(
+    train_dataset,
+    val_dataset,
+    batch_size: int,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Wrap PyTorch Datasets into DataLoaders.
+
+    Args:
+        train_dataset: Training dataset (sequence windows -> targets).
+        val_dataset: Validation dataset (same format as train).
+        batch_size: Number of samples per batch.
+
+    Returns:
+        (train_loader, val_loader) DataLoaders ready for run_epoch().
+    """
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    return train_loader, val_loader
+
+
+# ============================================================
+# 3. SINGLE-EPOCH TRAINING / EVAL
+# ============================================================
+
+
+def run_epoch(
+    model: torch.nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    train: bool = True,
+) -> Dict[str, float]:
+    """
+    Run one epoch of quantile-forecast training or evaluation.
+
+    Batch format (from BTCTFTDataset):
+      - (x_past, y) when no future covariates are provided
+      - (x_past, x_future, y) when known-future covariates are enabled
+
+    Shapes:
+      - x_past:   (B, SEQ_LENGTH, input_size)
+      - x_future: (B, future_input_size)  (per-sample vector aligned to step t+H)
+      - y:        (B, H)
+      - y_hat:    (B, H, Q)
+
+    Returns:
+      {"loss": avg_pinball, "mae": avg_mae_at_H}
+      where mae is computed on q=0.5 at horizon FORECAST_HORIZON.
+    """
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    if train and optimizer is None:
+        raise ValueError("optimizer must not be None when train=True")
+
+    total_loss = 0.0
+    total_mae = 0.0
+    num_samples = 0
+
+    for batch in data_loader:
+        # Unpack batch: either (X_past, y) or (X_past, X_future, y)
+        if len(batch) == 2:
+            x_past, y = batch
+            x_future = None
+        elif len(batch) == 3:
+            x_past, x_future, y = batch
+        else:
+            raise ValueError(
+                f"Expected batch of length 2 or 3, got {len(batch)}. "
+                "Check BTCTFTDataset.__getitem__."
+            )
+
+        x_past = x_past.to(device)
+        y = y.to(device)
+        if x_future is not None:
+            x_future = x_future.to(device)
+
+        with torch.set_grad_enabled(train):
+            # Forward
+            if x_future is not None:
+                y_hat = model(x_past, x_future)  # (B, H, Q)
+            else:
+                y_hat = model(x_past)  # (B, H, Q)
+
+            # Loss
+            loss = utils.pinball_loss(y_true=y, y_pred=y_hat, quantiles=cfg.QUANTILES)
+
+            # MAE is computed on the median quantile (q=0.5) at the configured horizon step.
+            # Note: horizon_step uses the same convention as targets y_ret_1..y_ret_H.
+            batch_mae = utils.mae_on_median_at_horizon(
+                y_true=y,
+                y_pred=y_hat,
+                quantiles=cfg.QUANTILES,
+                horizon_step=cfg.FORECAST_HORIZON,
+            )
+
+            # Backward + optimize
+            if train:
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+
+                clip_value = cfg.TRAINING_CONFIG.grad_clip
+                if clip_value is not None and clip_value > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+
+                optimizer.step()
+
+        batch_size = y.size(0)
+        total_loss += float(loss.item()) * batch_size
+        total_mae += float(batch_mae) * batch_size
+        num_samples += batch_size
+
+    if num_samples == 0:
+        raise RuntimeError("DataLoader has zero samples in run_epoch().")
+
+    return {
+        "loss": total_loss / num_samples,
+        "mae": total_mae / num_samples,
+    }
+
 
 if __name__ == "__main__":
     main()

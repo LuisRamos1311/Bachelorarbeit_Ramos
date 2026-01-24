@@ -1,0 +1,65 @@
+{
+  "task_type": "quantile_forecast",
+  "forecast": {
+    "H": 24,
+    "quantiles": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "signal_horizon": 24,
+    "val_pinball": 0.007495287828472083,
+    "test_pinball": 0.004650582340908558,
+    "val_mae_at_signal": 0.03315600007772446,
+    "test_mae_at_signal": 0.019662849605083466
+  },
+  "signal": {
+    "selected_threshold": 0.023199051991105078
+  },
+  "costs_and_baselines": {
+    "trading_days_per_year": 365,
+    "cost_bps": 5.0,
+    "slippage_bps": 2.0,
+    "strategy_long_rate": {
+      "val": 0.9,
+      "test": 0.15437987857762359
+    },
+    "strategy_net": {
+      "val": {
+        "cumulative_return": 0.5904582657172697,
+        "sharpe": 1.0969060057062936,
+        "max_drawdown": 0.49771444151785316,
+        "hit_rate": 0.5074074074074074,
+        "avg_trade_return": 0.0027557995409794645
+      },
+      "test": {
+        "cumulative_return": -0.3230969884455761,
+        "sharpe": -0.3782401057967551,
+        "max_drawdown": 0.3947551709285311,
+        "hit_rate": 0.4887640449438202,
+        "avg_trade_return": -0.0015135548877265798
+      }
+    },
+    "buy_hold_net": {
+      "test": {
+        "cumulative_return": 0.5184147824962502,
+        "sharpe": 0.5155747857035785,
+        "max_drawdown": 0.7667251748494007,
+        "hit_rate": 0.4934952298352125,
+        "avg_trade_return": 0.0007769291368557922
+      }
+    },
+    "random_baseline_summary": {
+      "test": {
+        "runs": 1000,
+        "long_rate": 0.15437987857762359,
+        "sharpe_mean": -0.083117058869223,
+        "sharpe_median": -0.07824285324666394,
+        "sharpe_p95": 0.7582237851071687,
+        "cumulative_return_mean": -0.06358029682077675,
+        "cumulative_return_median": -0.12149083770751856,
+        "cumulative_return_p95": 0.5538700611303514
+      }
+    }
+  }
+}

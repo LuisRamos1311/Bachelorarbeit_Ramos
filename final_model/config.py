@@ -19,11 +19,28 @@ This file also defines:
 - Forecast horizon + quantiles (FORECAST_HORIZON, QUANTILES)
 - Model / training hyperparameters
 - Evaluation & trading signal-threshold defaults
+
+Quick start:
+1) Put your CSVs under: <project_root>/data/
+2) Choose FREQUENCY ("D" or "1h")
+3) Set TRAIN/VAL/TEST date ranges to match your CSV coverage
+4) Toggle optional data blocks (USE_ONCHAIN / USE_SENTIMENT)
+5) Adjust SEQ_LENGTH / FORECAST_HORIZON / QUANTILES as needed
 """
 
 import os
 from dataclasses import dataclass
 from typing import List
+
+# Public configuration objects imported across the project:
+# - MODEL_CONFIG: model hyperparameters + derived input/output sizes
+# - TRAINING_CONFIG: training hyperparameters (batch size, lr, epochs, etc.)
+# - BEST_MODEL_PATH: where the best checkpoint is saved/loaded
+#
+# Users only need to edit:
+# - Date windows (TRAIN_*/VAL_*/TEST_*)
+# - Feature toggles (USE_ONCHAIN / USE_SENTIMENT / etc.)
+
 
 # ============================
 # 1. DATA PATHS
@@ -53,6 +70,8 @@ BTC_DAILY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_daily.csv")
 BTC_HOURLY_CSV_PATH = os.path.join(DATA_DIR, "BTCUSD_hourly.csv")
 
 # Data frequency for the BTC price CSV used in this run
+# - Use "D" to train/evaluate on BTC_DAILY_CSV_PATH
+# - Use "1h" to train/evaluate on BTC_HOURLY_CSV_PATH
 FREQUENCY: str = "1h"  # "D" for daily bars, "1h" for hourly bars, etc.
 
 # On-chain daily CSV (used when USE_ONCHAIN is True)
@@ -104,7 +123,11 @@ FORECAST_HORIZON: int = 24
 # Quantiles predicted at each step 1..H
 QUANTILES: List[float] = [0.1, 0.5, 0.9]
 
-# Multi-step return targets (y_ret_1 ... y_ret_H)
+# ----------------------------
+# Derived columns (auto-built)
+# ----------------------------
+# Multi-step return targets (y_ret_1 ... y_ret_H).
+# change FORECAST_HORIZON instead and this list updates automatically.
 TARGET_RET_PREFIX: str = "y_ret_"
 TARGET_RET_COLS: List[str] = [f"{TARGET_RET_PREFIX}{h}" for h in range(1, FORECAST_HORIZON + 1)]
 
@@ -206,14 +229,21 @@ FUTURE_COVARIATE_COLS: List[str] = [
 
 
 # ============================
-# 4. MODEL HYPERPARAMETERS
+# 5. MODEL HYPERPARAMETERS
 # ============================
-
 
 @dataclass
 class ModelConfig:
     """
     Hyperparameters for the Temporal Fusion Transformer model.
+
+    Mental model:
+    - The model consumes past covariates with `input_size = len(FEATURE_COLS)`.
+    - Optionally it also consumes known future covariates with
+      `future_input_size = len(FUTURE_COVARIATE_COLS)` (calendar-like features).
+    - For quantile forecasting, the output head produces
+      `output_size = FORECAST_HORIZON * len(QUANTILES)` values, which other code
+      reshapes into (H, Q) per sample.
     """
     # --- Core sizes ---
     hidden_size: int = 32
@@ -253,7 +283,6 @@ MODEL_CONFIG = ModelConfig()
 # ============================
 # 5. TRAINING HYPERPARAMETERS
 # ============================
-
 
 @dataclass
 class TrainingConfig:

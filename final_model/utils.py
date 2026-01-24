@@ -6,9 +6,10 @@ Utility functions for the TFT BTC forecasting project.
 This module provides:
 - Reproducibility helpers (set_seed)
 - Device selection (get_device)
-- Quantile-forecast helpers (pinball loss, MAE on median at horizon)
+- Quantile-forecast helpers (pinball loss, MAE on median at horizon, quantile index lookup)
 - Trading/backtest utilities (positions, costs, equity curve, metrics, baselines)
-- Plotting/reporting helpers (training curves, forecast bands, threshold sweeps, equity curves, signal confusion matrix)
+- Plotting helpers (training curves, threshold sweep, equity curves, signal confusion matrix)
+- Lightweight reporting writers (CSV tables, JSON metrics)
 """
 
 from __future__ import annotations
@@ -21,10 +22,10 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
+
 # ============================================================
 # 1. SEED CONTROL & DEVICE / PATH HELPERS
 # ============================================================
-
 def set_seed(seed: int = 42) -> None:
     """
     Set random seeds for Python, NumPy, and PyTorch.
@@ -69,10 +70,10 @@ def get_timestamp() -> str:
 def ensure_dir(path: str) -> None:
     """
     Create directory `path` if it doesn't already exist.
-
     Safe to call multiple times.
     """
     os.makedirs(path, exist_ok=True)
+
 
 def guard_dir_missing_or_empty(path: str, *, display_name: str = "standard") -> None:
     """
@@ -98,10 +99,10 @@ def guard_dir_missing_or_empty(path: str, *, display_name: str = "standard") -> 
     else:
         os.makedirs(path, exist_ok=False)
 
+
 # ============================================================
 # 2. NUMPY CONVERSION HELPER
 # ============================================================
-
 def _to_numpy_1d(x: Any) -> np.ndarray:
     """
     Convert a torch.Tensor / np.ndarray / list to a 1D NumPy array.
@@ -123,9 +124,8 @@ def _to_numpy_1d(x: Any) -> np.ndarray:
 
 
 # ============================================================
-# 4. TRADING HELPERS
+# 3. QUANTILE FORECAST HELPERS
 # ============================================================
-
 def pinball_loss(
     y_true: torch.Tensor,
     y_pred: torch.Tensor,
@@ -179,6 +179,7 @@ def pinball_loss(
     loss = torch.maximum((q - 1.0) * err, q * err)
     return loss.mean()
 
+
 def _closest_quantile_index(quantiles: Sequence[float], target: float = 0.5) -> int:
     """
     Return index of quantile closest to `target` (default median=0.5).
@@ -188,6 +189,7 @@ def _closest_quantile_index(quantiles: Sequence[float], target: float = 0.5) -> 
     diffs = [abs(float(q) - target) for q in quantiles]
     return int(np.argmin(diffs))
 
+
 def nearest_quantile_index(quantiles: Sequence[float], q: float = 0.5) -> int:
     """
     Return index of the quantile value closest to q.
@@ -196,6 +198,7 @@ def nearest_quantile_index(quantiles: Sequence[float], q: float = 0.5) -> int:
     to avoid duplicating logic.
     """
     return _closest_quantile_index(quantiles, target=q)
+
 
 def mae_on_median_at_horizon(
     y_true: torch.Tensor,
@@ -245,6 +248,10 @@ def mae_on_median_at_horizon(
     err = torch.abs(y_med - y_true[:, h_idx])
     return float(err.mean().item())
 
+
+# ============================================================
+# 4. TRADING / BACKTEST HELPERS
+# ============================================================
 def compute_trading_metrics(
     returns: Any,
     positions: Any,
@@ -263,13 +270,16 @@ def compute_trading_metrics(
             For crypto with 24h decision steps, this is typically 365 (see config.TRADING_DAYS_PER_YEAR).
 
     Returns:
-        Dict with:
+        Dict with (non-empty inputs):
             - avg_daily_return: mean strategy return per decision step (historical name; 'daily' when step=24h)
             - cumulative_return: compounded return over the period
             - sharpe: annualized Sharpe using `trading_days_per_year`
             - hit_ratio: fraction of positive returns when in position
             - avg_return_in_position: mean return conditional on being in position
             - in_position_rate: fraction of steps with non-zero position
+        Note:
+            If `returns` is empty (len == 0), this function returns a minimal zero-metrics
+            dict without the `in_position_rate` key (to match the early-return behavior).
     """
     r = _to_numpy_1d(returns)
     p = _to_numpy_1d(positions)
@@ -281,6 +291,7 @@ def compute_trading_metrics(
         )
 
     if r.size == 0:
+        # Minimal empty-series output (intentionally omits in_position_rate).
         return {
             "avg_daily_return": 0.0,
             "cumulative_return": 0.0,
@@ -326,6 +337,7 @@ def compute_trading_metrics(
         "in_position_rate": in_position_rate
     }
 
+
 def _bps_to_return(bps: float) -> float:
     """Convert basis points to decimal return. 1 bp = 0.0001."""
     return float(bps) / 10000.0
@@ -357,6 +369,7 @@ def apply_costs(
 
     per_side = _bps_to_return(cost_bps + slippage_bps)
 
+    # Assume we start "flat" before the first step, so the first 1 counts as an entry (cost is charged).
     prev = np.concatenate(([0], p[:-1]))
     changed = (p != prev)
 
@@ -392,7 +405,6 @@ def equity_curve(
     net_r = p * r - c
     for i in range(r.size):
         equity[i + 1] = equity[i] * (1.0 + net_r[i])
-
     return equity
 
 
@@ -485,6 +497,9 @@ def compute_backtest_metrics(
     }
 
 
+# ============================================================
+# 5. BASELINES
+# ============================================================
 def buy_and_hold_baseline(
     returns: Any,
     cost_bps: float,
@@ -573,9 +588,8 @@ def random_exposure_baseline(
 
 
 # ============================================================
-# 5. TRAINING CURVE PLOTTING
+# 6. PLOTTING HELPERS
 # ============================================================
-
 def plot_training_curves(history: Dict[str, Sequence[float]], out_path: str) -> None:
     """
     Plot training/validation curves from a history dict (quantile-only).
@@ -630,132 +644,8 @@ def plot_training_curves(history: Dict[str, Sequence[float]], out_path: str) -> 
 
 
 # ============================================================
-# 8. REPORTING PACK HELPERS
+# 7. REPORTING PACK HELPERS
 # ============================================================
-
-def save_table_csv(rows: Sequence[Dict[str, Any]], out_path: str) -> None:
-    """
-    Save a list of dictionaries as a CSV table.
-
-    This is intentionally lightweight (no pandas dependency) because it is
-    meant for thesis/report artifacts.
-
-    Args:
-        rows:
-            Sequence of row dicts. All keys found across all rows become
-            columns in the CSV.
-        out_path:
-            Output CSV path.
-    """
-    if rows is None:
-        raise ValueError("rows must not be None")
-    rows_list = list(rows)
-    if len(rows_list) == 0:
-        raise ValueError("rows is empty; refusing to write an empty table.")
-
-    # Collect columns in a stable order: keys of first row, then any new keys in later rows
-    fieldnames: list[str] = []
-    seen = set()
-    for k in rows_list[0].keys():
-        fieldnames.append(str(k))
-        seen.add(str(k))
-
-    for r in rows_list[1:]:
-        for k in r.keys():
-            ks = str(k)
-            if ks not in seen:
-                fieldnames.append(ks)
-                seen.add(ks)
-
-    parent = os.path.dirname(out_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-    with open(out_path, "w", encoding="utf-8", newline="") as f:
-        import csv  # local import keeps top-level import changes minimal
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows_list:
-            # Convert numpy scalars to Python scalars for nicer CSV output
-            clean_row = {}
-            for k in fieldnames:
-                v = r.get(k, "")
-                if isinstance(v, (np.generic,)):
-                    v = v.item()
-                clean_row[k] = v
-            writer.writerow(clean_row)
-
-def plot_quantile_forecast_band(
-    y_true: Any,
-    y_pred_q: Any,
-    quantiles: Sequence[float],
-    out_path: str,
-    title: str = "Forecast band",
-    q_low: float = 0.1,
-    q_mid: float = 0.5,
-    q_high: float = 0.9,
-    window: int | None = 500,
-) -> None:
-    """
-    Plot actual series against predicted median with a (q_low, q_high) uncertainty band.
-
-    Expected shapes:
-      - y_true: (N,)
-      - y_pred_q: (N, Q)  where Q = len(quantiles)
-
-    If window is provided, plot only the LAST `window` points to keep figures readable.
-    """
-    y_true_arr = _to_numpy_1d(y_true)
-
-    if isinstance(y_pred_q, torch.Tensor):
-        y_pred_arr = y_pred_q.detach().cpu().numpy()
-    else:
-        y_pred_arr = np.asarray(y_pred_q)
-
-    if y_pred_arr.ndim != 2:
-        raise ValueError(f"y_pred_q must have shape (N,Q), got {y_pred_arr.shape}")
-
-    if y_pred_arr.shape[0] != y_true_arr.shape[0]:
-        raise ValueError(
-            f"y_true and y_pred_q must have same length, got "
-            f"{y_true_arr.shape[0]} vs {y_pred_arr.shape[0]}"
-        )
-
-    low_i = _closest_quantile_index(quantiles, q_low)
-    mid_i = _closest_quantile_index(quantiles, q_mid)
-    high_i = _closest_quantile_index(quantiles, q_high)
-
-    y_low = y_pred_arr[:, low_i]
-    y_mid = y_pred_arr[:, mid_i]
-    y_high = y_pred_arr[:, high_i]
-
-    if window is not None and window > 0 and y_true_arr.shape[0] > window:
-        y_true_arr = y_true_arr[-window:]
-        y_low = y_low[-window:]
-        y_mid = y_mid[-window:]
-        y_high = y_high[-window:]
-
-    x = np.arange(y_true_arr.shape[0])
-
-    parent = os.path.dirname(out_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(x, y_true_arr, label="Actual")
-    ax.plot(x, y_mid, label=f"Pred q{q_mid:g}")
-    ax.fill_between(x, y_low, y_high, alpha=0.2, label=f"Band q{q_low:g}–q{q_high:g}")
-
-    ax.set_title(title)
-    ax.set_xlabel("Time index (windowed)")
-    ax.set_ylabel("Return")
-    ax.legend(loc="best")
-
-    fig.tight_layout()
-    fig.savefig(out_path)
-    plt.close(fig)
-
-
 def plot_threshold_sweep(
     sweep_records: Sequence[Dict[str, Any]],
     out_path: str,
@@ -857,6 +747,7 @@ def plot_equity_curves(
     fig.savefig(out_path)
     plt.close(fig)
 
+
 def plot_signal_confusion_matrix(
     actual_up: Any,
     model_long: Any,
@@ -885,6 +776,7 @@ def plot_signal_confusion_matrix(
     for t, p in zip(y_true, y_pred):
         cm[t, p] += 1
 
+    # NOTE: out_path should include a directory (e.g. "standard/plots/plot.png").
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(6, 4.5))
@@ -929,6 +821,63 @@ def plot_signal_confusion_matrix(
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
+
+
+# ============================================================
+# 8. REPORTING / SERIALIZATION
+# ============================================================
+def save_table_csv(rows: Sequence[Dict[str, Any]], out_path: str) -> None:
+    """
+    Save a list of dictionaries as a CSV table.
+
+    This is intentionally lightweight (no pandas dependency) because it is
+    meant for thesis/report artifacts.
+
+    Args:
+        rows:
+            Sequence of row dicts. All keys found across all rows become
+            columns in the CSV.
+        out_path:
+            Output CSV path.
+    """
+    if rows is None:
+        raise ValueError("rows must not be None")
+    rows_list = list(rows)
+    if len(rows_list) == 0:
+        raise ValueError("rows is empty; refusing to write an empty table.")
+
+    # Collect columns in a stable order: keys of first row, then any new keys in later rows
+    fieldnames: list[str] = []
+    seen = set()
+    for k in rows_list[0].keys():
+        fieldnames.append(str(k))
+        seen.add(str(k))
+
+    for r in rows_list[1:]:
+        for k in r.keys():
+            ks = str(k)
+            if ks not in seen:
+                fieldnames.append(ks)
+                seen.add(ks)
+
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        import csv  # local import keeps top-level import changes minimal
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows_list:
+            # Convert numpy scalars to Python scalars for nicer CSV output
+            clean_row = {}
+            for k in fieldnames:
+                v = r.get(k, "")
+                if isinstance(v, (np.generic,)):
+                    v = v.item()
+                clean_row[k] = v
+            writer.writerow(clean_row)
+
 
 def save_json(data: Dict[str, Any], path: str) -> None:
     """

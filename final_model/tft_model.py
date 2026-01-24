@@ -16,14 +16,23 @@ Architecture (simplified):
 4) Temporal feed-forward block (GRN-gated or residual MLP)
 5) Optional future-covariate encoder for t+H known features (calendar/halving)
 6) Output head determined by output_size (see above)
+
+Usage:
+- train_tft.py / evaluate_tft.py build tensors shaped like:
+    x_past:   (B, SEQ_LENGTH, len(FEATURE_COLS))
+    x_future: (B, len(FUTURE_COVARIATE_COLS))  [only if enabled]
+- The model returns y_hat shaped (B, FORECAST_HORIZON, len(QUANTILES)).
 """
 
 from __future__ import annotations
-
 import torch
 from torch import nn
 from final_model import config
 
+# Public classes:
+# - TemporalFusionTransformer: main model used by train_tft.py / evaluate_tft.py
+# - GatedResidualNetwork: building block (used internally)
+# - VariableSelectionNetwork: building block (used internally)
 
 # ============================
 # 1. Gated Residual Network
@@ -40,7 +49,7 @@ class GatedResidualNetwork(nn.Module):
 
     Shapes:
         x:       (batch, ..., input_size)
-        context: (batch, ..., input_size) or (batch, input_size) or None
+        context: broadcastable to x (batch, ..., input_size) or (batch, input_size) or None
 
     Output:
         same shape as x, but with last dimension = output_size
@@ -414,10 +423,11 @@ class TemporalFusionTransformer(nn.Module):
 
         # -------- Quantile-head shape contract (fail fast) --------
         # Canonical API: config.FORECAST_HORIZON (int) + config.QUANTILES (list[float])
+        # NOTE: This contract intentionally uses the *global* config values so that
+        # training/evaluation stay consistent even if a custom `model_config` is passed in.
         self.horizon: int = int(config.FORECAST_HORIZON)
         self.quantiles: tuple[float, ...] = tuple(config.QUANTILES)
         self.n_quantiles: int = len(self.quantiles)
-
 
         if self.horizon <= 0:
             raise ValueError(f"FORECAST_HORIZON must be > 0, got {self.horizon}.")
@@ -450,18 +460,23 @@ class TemporalFusionTransformer(nn.Module):
         x_future: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Forward pass of the TFT model.
+        Forward pass (quantile multi-horizon forecasting).
+
         Args:
             x_past:
-                Past covariates, tensor of shape (batch_size, seq_length, input_size).
+                Past covariates of shape (B, T, F), where:
+                  - B = batch size
+                  - T = seq_length
+                  - F = config.MODEL_CONFIG.input_size (len(FEATURE_COLS))
             x_future:
-                Future covariates for t+H, tensor of shape
-                (batch_size, future_input_size). If
-                config.MODEL_CONFIG.use_future_covariates is True, this must
-                be provided. If the flag is False, x_future is ignored.
+                Optional known-future covariates of shape (B, F_future),
+                aligned to the forecast endpoint (t+H).
+                Required when config.MODEL_CONFIG.use_future_covariates=True.
+
         Returns:
-            outputs:
-                Tensor of shape (batch_size, H, Q) containing quantile forecasts.
+            Quantile forecasts of shape (B, H, Q), where:
+              - H = config.FORECAST_HORIZON
+              - Q = len(config.QUANTILES)
         """
         # x_past: (B, T, F)
         batch_size, seq_length, input_size = x_past.shape
@@ -506,6 +521,7 @@ class TemporalFusionTransformer(nn.Module):
         # ---- Step 1: Variable selection or simple projection ----
         if self.config.use_variable_selection:
             # x_proj: (B, T, H)
+            # We ignore selection weights here, but they can be logged for interpretability.
             x_proj, _ = self.vsn_past(x_past)
         else:
             # Plain linear projection: (B, T, F) -> (B, T, H)
